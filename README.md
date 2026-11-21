@@ -5,8 +5,50 @@ Add Photos / Import Video → Align Photos → Optimize Cameras → Build Depth 
 Build Mesh → Build Texture → Export / Generate Report. It is image- and video-only: no LiDAR, laser
 scans, DEMs or orthomosaics.
 
-It is pure Python on top of **numpy, scipy, OpenCV and scikit-image**, plus **FFmpeg** for video.
-It needs no CUDA, COLMAP or compiled extensions.
+It is pure Python on top of **numpy, scipy, OpenCV and scikit-image**, plus **FFmpeg** for video, with an optional
+**PyTorch / CUDA** path (learned features, GPU depth maps, GPU bundle adjustment). It needs no COLMAP or compiled
+extensions.
+
+## Gallery: the Bariniki site
+
+474 frames extracted from phone video along a stone wall, processed end to end with the default settings
+(ALIKED + LightGlue, high-quality depth maps) on a laptop RTX 5070.
+
+| Photos | Aligned | Reprojection error | Tie points | Dense points | Mesh | Texture | Total time |
+|---|---|---|---|---|---|---|---|
+| 474 | 414 | 0.71 px | 157,745 | 43.9 M | 1.18 M faces | 8192 px | ~35 min |
+
+Align 13 min · depth maps 18 min · point cloud 1 min · mesh 1 min · texture 1 min.
+
+**Fly-through along the path the video was filmed** (Tools → Fly-through Video, `capture` path):
+
+![Fly-through along the capture path](docs/media/flythrough_capture.webp)
+
+**Photo vs model.** Left: the original frame (undistorted). Right: the textured model rendered from the same
+recovered camera. Dark grey = no surface reconstructed there.
+
+![Photo vs model](docs/media/photo_vs_model_1.jpg)
+![Photo vs model](docs/media/photo_vs_model_2.jpg)
+
+**The pipeline, one viewpoint:** tie points with the recovered camera path, dense point cloud, mesh, textured model.
+
+![Pipeline stages](docs/media/pipeline_stages.jpg)
+
+| Textured model | Mesh geometry |
+|---|---|
+| ![Textured](docs/media/textured_2.jpg) | ![Shaded](docs/media/shaded_1.jpg) |
+| ![Textured](docs/media/textured_1.jpg) | ![Textured](docs/media/textured_3.jpg) |
+
+**Orbit** around the whole site ([MP4](docs/media/flythrough_orbit.mp4); also a [flyover](docs/media/flythrough_flyover.mp4)):
+
+![Orbit](docs/media/flythrough_orbit.webp)
+
+**Desktop app** (Metashape-style layout: workspace tree, 3D view with cameras and region, photo strip):
+
+![Desktop GUI](docs/media/gui.jpg)
+
+Regenerate this gallery for any finished project with `docs\make_media.bat` (edit the project name) or
+`uv run python docs\make_media.py projects\<name>`.
 
 ## Install (Windows, uv)
 

@@ -27,15 +27,35 @@ def _smooth(t):
 
 
 def site_frame(chunk):
-    """Centre, axes (R rows: x, y, up) and horizontal half-extent of the region (or the tie points)."""
-    if chunk.region:
+    """Centre, axes (rows: x, y, up) and size of the site for framing shots.
+    Up = mean 'up' direction of the photos (people hold cameras upright, so this follows gravity much better
+    than the region box, whose short axis can be tilted on long or steep sites); centre, horizontal axes and size
+    from the 2-98% range of the tie points (robust to stray points far away)."""
+    from . import camera as cm
+    sp = chunk.load_sparse()
+    cams = chunk.aligned_cameras()
+    if sp is None or len(sp["points"]) < 10 or len(cams) < 3:
         c = np.array(chunk.region["center"], float)
-        R = np.array(chunk.region["R"], float)
-        s = np.array(chunk.region["size"], float)
-    else:
-        from .sfm import region_from_sparse
-        reg = region_from_sparse(chunk)
-        c, R, s = np.array(reg["center"]), np.array(reg["R"]), np.array(reg["size"])
+        return c, np.array(chunk.region["R"], float), np.array(chunk.region["size"], float)
+    ups = np.array([-(cm.rodrigues_to_R(chunk.cameras[i].rvec)[0].T @ [0, 1.0, 0]) for i in cams])
+    U = ups.mean(0); U /= np.linalg.norm(U)
+    P = np.asarray(sp["points"], float)
+    mp = chunk.path("mesh.ply")
+    if os.path.exists(mp):                                       # frame the model itself when there is one
+        from .io import read_ply_sampled
+        P = read_ply_sampled(mp, 400_000)["verts"]
+    lo, hi = np.percentile(P, 2, 0), np.percentile(P, 98, 0)
+    P = P[np.all((P >= lo) & (P <= hi), 1)]
+    c = np.median(P, 0)
+    Q = P - c
+    Qh = Q - np.outer(Q @ U, U)                                  # horizontal components
+    w, v = np.linalg.eigh(Qh.T @ Qh)
+    X = v[:, -1] - (v[:, -1] @ U) * U; X /= np.linalg.norm(X)   # long horizontal axis
+    Y = np.cross(U, X)
+    R = np.stack([X, Y, U])
+    q = Q @ R.T
+    s = np.percentile(q, 98, 0) - np.percentile(q, 2, 0)
+    c = c + R.T @ (0.5 * (np.percentile(q, 98, 0) + np.percentile(q, 2, 0)))
     return c, R, s
 
 
@@ -193,10 +213,7 @@ def render_flythrough(chunk, out=None, pattern="orbit", seconds=20.0, fps=30, si
     os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
     eye, tgt, up = camera_path(chunk, pattern, n, elevation, distance, start_angle, fov, arc)
     pl = pv.Plotter(off_screen=True, window_size=[W, H])
-    try:
-        pl.set_background("#9fb4c8", top="#2b3a4c")
-    except TypeError:
-        pl.set_background("#3a4656")
+    pl.set_background("#3a3f46")      # neutral: partial models (no ground beyond the scan) look odd against a sky
     for aa in ("ssaa", "msaa", "fxaa"):
         try:
             pl.enable_anti_aliasing(aa); break

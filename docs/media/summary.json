@@ -1,0 +1,18 @@
+{
+ "project": "bariniki",
+ "cameras": 474,
+ "aligned": 414,
+ "rms_px": 0.71,
+ "tie_points": 157745,
+ "dense_points": 43852572,
+ "faces": 1180766,
+ "texture": 8192,
+ "steps": {
+  "Align Photos": 804,
+  "Build Depth Maps": 1107,
+  "Build Point Cloud": 70,
+  "Build Mesh": 61,
+  "Build Texture": 50,
+  "Fly-through Video": 5
+ }
+}

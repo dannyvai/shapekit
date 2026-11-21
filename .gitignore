@@ -27,3 +27,8 @@ exports/
 .idea/
 Thumbs.db
 desktop.ini
+
+# README gallery: large intermediates not shown in the README
+docs/media/flythrough_capture.mp4
+docs/media/flythrough_flyover.webp
+docs/media/flythrough_*.gif
