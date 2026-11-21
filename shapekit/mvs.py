@@ -429,7 +429,7 @@ def build_point_cloud(chunk, point_spacing=None, stride=1, min_conf=0):
     cams = chunk.aligned_cameras()
     log("Build Point Cloud: back-projecting %d filtered depth maps into 3D (with colours and normals)..." % len(cams))
     est = _estimate_raw_points(chunk, cams)
-    if fast_mode() and est > STREAM_POINTS:
+    if fast_mode() and _needs_out_of_core(est):
         return _build_point_cloud_streaming(chunk, cams, stride, point_spacing, min_conf, est, t0)
     if fast_mode():
         from concurrent.futures import ThreadPoolExecutor
@@ -464,7 +464,22 @@ def build_point_cloud(chunk, point_spacing=None, stride=1, min_conf=0):
     return P, Cc, N, Q
 
 
-STREAM_POINTS = 40_000_000      # above this many raw points the cloud is fused out-of-core
+STREAM_POINTS = None            # force a threshold (raw points) for out-of-core fusion; None = decide from free RAM
+BYTES_PER_RAW_POINT = 150       # measured peak of the in-memory path (arrays + concatenation + crop + voxel merge)
+MEMORY_MARGIN = 0.6             # use the in-memory path only if it needs < 60% of the RAM available right now
+
+
+def _needs_out_of_core(est):
+    """True when the in-memory fusion would not fit in the available RAM with a safety margin."""
+    from .util import available_memory
+    if STREAM_POINTS is not None:
+        return est > STREAM_POINTS
+    need = est * BYTES_PER_RAW_POINT
+    avail = available_memory()
+    if avail is None:
+        return est > 40_000_000
+    log("  point cloud memory: ~%.1f GB needed in memory, %.1f GB available" % (need / 1e9, avail / 1e9))
+    return need > MEMORY_MARGIN * avail
 
 
 def _estimate_raw_points(chunk, cams):
@@ -498,7 +513,7 @@ def _build_point_cloud_streaming(chunk, cams, stride, point_spacing, min_conf, e
     k0lo = int(np.floor(corners[:, 0].min() / size)) - 1
     k0hi = int(np.floor(corners[:, 0].max() / size)) + 1
     nslab = int(np.clip(np.ceil(est / 12e6), 2, 256))
-    log("  large cloud (~%s raw points): fusing out-of-core in %d slabs (temporary files in %s)" %
+    log("  not enough free memory for ~%s raw points: fusing out-of-core in %d slabs (temporary files in %s)" %
         ("{:,}".format(est), nslab, tmp))
     files = [[open(os.path.join(tmp, "%03d_%s.bin" % (k, f)), "wb") for f in "PCNQ"] for k in range(nslab)]
     counts = np.zeros(nslab, np.int64)
