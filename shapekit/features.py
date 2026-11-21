@@ -14,6 +14,10 @@ import cv2
 from .util import log, read_image, UnionFind
 
 ACCURACY = {"highest": 2.0, "high": 1.0, "medium": 0.5, "low": 0.25, "lowest": 0.125}
+# Learned features: longest image side the network sees. Video frames (1920 px) are unaffected; 12+ MP photos
+# would need several GB of GPU memory at native size (and can take the whole process down), so they are
+# processed at this size -- keypoints are still returned in full-resolution pixel coordinates.
+LEARNED_MAX_SIDE = int(os.environ.get("SHAPEKIT_MAX_SIDE", "2048"))
 
 
 def _feat_path(chunk, i):
@@ -48,10 +52,13 @@ def detect_features(chunk, accuracy="high", max_features=10000, force=False, mas
         sift = cv2.SIFT_create(nfeatures=max_features, contrastThreshold=0.02)
     else:
         from . import learned
-        sen0 = chunk.sensors[chunk.cameras[0].sensor]
-        resize = None if scale >= 1 else int(round(max(sen0.width, sen0.height) * scale))
-        lf = learned.get(method, max_features, resize)
+        lf = learned.get(method, max_features, None)
         log("  %s + LightGlue on %s" % (method, learned.describe_device()))
+        big = sorted({(s.width, s.height) for s in chunk.sensors if max(s.width, s.height) * min(scale, 1) > LEARNED_MAX_SIDE})
+        if big:
+            log("  photos larger than %d px (%s) are analysed at %d px on their longest side (GPU memory); "
+                "keypoints keep full-resolution coordinates" % (LEARNED_MAX_SIDE, ", ".join("%dx%d" % b for b in big),
+                                                                 LEARNED_MAX_SIDE))
     cached = sum(os.path.exists(_feat_path(chunk, i)) for i in range(len(chunk.cameras))) if not force else 0
     if cached:
         log("  features already computed for %d/%d photos - reused" % (cached, len(chunk.cameras)))
@@ -61,7 +68,9 @@ def detect_features(chunk, accuracy="high", max_features=10000, force=False, mas
             continue
         if method != "sift":
             img = read_image(chunk.abspath(cam))
-            f = lf.extract(img)
+            side = max(img.shape[:2])
+            r = min(side if scale >= 1 else int(round(side * scale)), LEARNED_MAX_SIDE)
+            f = lf.extract(img, resize=None if r >= side else r)
             xy = f["xy"]
             xi = np.clip(xy.round().astype(int), 0, [img.shape[1] - 1, img.shape[0] - 1])
             rgb = img[xi[:, 1], xi[:, 0], ::-1] if len(xy) else np.zeros((0, 3), np.uint8)

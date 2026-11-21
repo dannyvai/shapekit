@@ -997,7 +997,33 @@ class MainWindow(QMainWindow):
         super().closeEvent(ev)
 
 
+def _crash_reporting():
+    """Hard crashes (GPU driver, out of memory in native code) kill the process without a Python traceback.
+    faulthandler writes the stack of every thread to crash.log when that happens; uncaught Python errors on
+    the GUI thread go there too."""
+    import faulthandler
+    import traceback
+    import time as _t
+    d = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "ShapeKit")
+    try:
+        os.makedirs(d, exist_ok=True)
+        f = open(os.path.join(d, "crash.log"), "a", buffering=1, encoding="utf-8")
+    except OSError:
+        return None
+    f.write("\n=== shapekit started %s ===\n" % _t.strftime("%Y-%m-%d %H:%M:%S"))
+    faulthandler.enable(file=f, all_threads=True)
+
+    def hook(et, ev, tb):
+        f.write("Uncaught exception:\n" + "".join(traceback.format_exception(et, ev, tb)))
+        sys.__excepthook__(et, ev, tb)
+    sys.excepthook = hook
+    return f.name
+
+
 def run(project_dir=None):
+    crash = _crash_reporting()
+    if crash:
+        print("crash reports (if the app ever closes unexpectedly): %s" % crash, flush=True)
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("shapekit")
     app.setStyle("Fusion")

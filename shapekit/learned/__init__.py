@@ -65,13 +65,16 @@ class LearnedFeatures:
                                  filter_threshold=0.1, mp=bool(fp16 and self.dev.type == "cuda"),
                                  flash=True).eval().to(self.dev)
 
-    def extract(self, img_bgr):
-        """img_bgr uint8 HxWx3 -> dict(xy (N,2) float32 in full-res pixel coords, desc (N,D) float16, score)."""
+    def extract(self, img_bgr, resize="default"):
+        """img_bgr uint8 HxWx3 -> dict(xy (N,2) float32 in full-res pixel coords, desc (N,D) float16, score).
+        resize: longest side the network sees (None = native); "default" = the value given at construction."""
+        if resize == "default":
+            resize = self.resize
         torch = self.torch
         rgb = np.ascontiguousarray(img_bgr[:, :, ::-1])
         t = torch.from_numpy(rgb).to(self.dev).permute(2, 0, 1).float() / 255.0
         with torch.inference_mode():
-            f = self.extractor.extract(t, resize=self.resize)
+            f = self.extractor.extract(t, resize=resize)
         return dict(xy=f["keypoints"][0].float().cpu().numpy(),
                     desc=f["descriptors"][0].float().cpu().numpy().astype(np.float16),
                     score=f["keypoint_scores"][0].float().cpu().numpy())

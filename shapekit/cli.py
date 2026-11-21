@@ -376,6 +376,8 @@ def cmd_process(a):
 
 
 def main(argv=None):
+    import faulthandler
+    faulthandler.enable()                       # native crashes print a stack instead of closing silently
     ap = argparse.ArgumentParser(prog="shapekit", description="Photogrammetry from videos and photos")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
