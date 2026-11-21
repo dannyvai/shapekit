@@ -52,6 +52,9 @@ def detect_features(chunk, accuracy="high", max_features=10000, force=False, mas
         resize = None if scale >= 1 else int(round(max(sen0.width, sen0.height) * scale))
         lf = learned.get(method, max_features, resize)
         log("  %s + LightGlue on %s" % (method, learned.describe_device()))
+    cached = sum(os.path.exists(_feat_path(chunk, i)) for i in range(len(chunk.cameras))) if not force else 0
+    if cached:
+        log("  features already computed for %d/%d photos - reused" % (cached, len(chunk.cameras)))
     for i, cam in enumerate(chunk.cameras):
         p = _feat_path(chunk, i)
         if os.path.exists(p) and not force:
@@ -256,6 +259,7 @@ def _match_job(args):
 def match_features(chunk, pairs, min_inliers=25, px_thresh=None, force=False, workers=None):
     out_p = chunk.path("matches.npz")
     if os.path.exists(out_p) and not force:
+        log("  matches already computed - reused")
         return
     if force:
         for fn in ("matches_partial.npz", "align_checkpoint.npz"):
@@ -386,6 +390,7 @@ def load_matches(chunk):
 
 def build_tracks(chunk, matches):
     """Union-find keypoints into tracks. Returns per-observation arrays (img, kp, track)."""
+    log("  linking matches of %d photo pairs into multi-photo tracks..." % len(matches))
     ncam = len(chunk.cameras)
     nk = np.array([len(np.load(_feat_path(chunk, i))["xy"]) for i in range(ncam)])
     off = np.concatenate([[0], np.cumsum(nk)])

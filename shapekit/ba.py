@@ -32,7 +32,7 @@ def _prior_terms(P, prior_idx, prior_X, prior_info):
 
 def bundle_adjust(cam_r, cam_t, pts, intr, cam_sensor, obs_cam, obs_pt, obs_uv,
                   fixed_cams=None, intr_mask=None, iters=10, huber=2.0, verbose=False, tol=1e-6,
-                  obs_w=None, prior_idx=None, prior_X=None, prior_info=None):
+                  obs_w=None, prior_idx=None, prior_X=None, prior_info=None, progress=None):
     """obs_w: per-observation weight (e.g. 4 for markers = 0.5 px vs 1 px tie points).
     prior_idx / prior_X / prior_info: point priors (GCPs) with isotropic information 1/sigma^2 (internal units)."""
     """All arrays are modified copies; returns (cam_r, cam_t, pts, intr, info).
@@ -178,6 +178,9 @@ def bundle_adjust(cam_r, cam_t, pts, intr, cam_sensor, obs_cam, obs_pt, obs_uv,
                 break
             lam *= 6
         info["iterations"] = it + 1
+        if progress:
+            from .util import log
+            log("    %s: iteration %d/%d, rms %.3f px" % (progress, it + 1, iters, np.sqrt((r ** 2).sum(1).mean())))
         if verbose:
             print("  BA it %d cost %.4g rms %.3f lam %.1e" % (it, cost, np.sqrt((r ** 2).sum(1).mean()), lam))
         if not accepted or rel < tol:

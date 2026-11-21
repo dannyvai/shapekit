@@ -236,6 +236,8 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
         for k, jb in enumerate(jobs):
             log("  depth map %d/%d %s" % (k + 1, len(jobs), _depth_job(jb, view)))
     chunk.stats["depth_maps"] = dict(quality=quality, filter=filter_mode, cameras=len(aligned), method=method)
+    log("  depth maps done; filtering (%s): keeping only depths confirmed by %d+ neighbouring photos..." %
+        (filter_mode, FILTER[filter_mode]))
     filter_depth_maps(chunk, filter_mode, nbmap, views=view)
     chunk.add_log("Build Depth Maps", time.time() - t0, quality=quality, filter=filter_mode, method=method)
 
@@ -356,7 +358,9 @@ def filter_depth_maps(chunk, mode="moderate", nbmap=None, views=None, rel_tol=0.
                 for i in aligned]
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(n_workers()) as ex:
-            list(ex.map(_filter_job, jobs, chunksize=2))
+            for k, _ in enumerate(ex.map(_filter_job, jobs, chunksize=2)):
+                if (k + 1) % max(1, len(jobs) // 10) == 0:
+                    log("  filtered %d/%d depth maps" % (k + 1, len(jobs)))
         log("  depth filtering (%s) done" % mode)
         return
     raw = {i: load_depth(chunk, i, filtered=False) for i in aligned}
@@ -415,10 +419,15 @@ def build_point_cloud(chunk, point_spacing=None, stride=1, min_conf=0):
     P, Cc, N, Q = [], [], [], []
     from .util import fast_mode, n_workers
     cams = chunk.aligned_cameras()
+    log("Build Point Cloud: back-projecting %d filtered depth maps into 3D (with colours and normals)..." % len(cams))
     if fast_mode():
         from concurrent.futures import ThreadPoolExecutor
+        outs = []
         with ThreadPoolExecutor(n_workers(8)) as ex:          # numpy / OpenCV release the GIL
-            outs = list(ex.map(lambda i: _cloud_view(chunk, i, stride), cams))
+            for k, o in enumerate(ex.map(lambda i: _cloud_view(chunk, i, stride), cams)):
+                outs.append(o)
+                if (k + 1) % max(1, len(cams) // 10) == 0:
+                    log("  %d/%d depth maps back-projected" % (k + 1, len(cams)))
     else:
         outs = [_cloud_view(chunk, i, stride) for i in cams]
     for o in outs:
@@ -429,11 +438,14 @@ def build_point_cloud(chunk, point_spacing=None, stride=1, min_conf=0):
     P, Cc, N, Q = crop_to_region(chunk, P, Cc, N, Q)
     if point_spacing is None:
         point_spacing = estimate_gsd(chunk, scale) * 1.0
+    log("  merging %s raw points on a %.4g grid (duplicates from overlapping photos are averaged)..." %
+        ("{:,}".format(len(P)), point_spacing))
     P, Cc, N, Q = voxel_merge(P, Cc, N, Q, point_spacing)
     if min_conf:
         m = Q >= min_conf
         P, Cc, N, Q = P[m], Cc[m], N[m], Q[m]
     from .io import write_ply
+    log("  writing point_cloud.ply (%s points)..." % "{:,}".format(len(P)))
     write_ply(chunk.path("point_cloud.ply"), P, colors=Cc, normals=N, extra={"confidence": Q.astype(np.uint8)})
     chunk.stats["point_cloud"] = dict(points=int(len(P)), spacing=float(point_spacing))
     chunk.add_log("Build Point Cloud", time.time() - t0, points=int(len(P)))

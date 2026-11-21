@@ -303,7 +303,7 @@ class Reconstruction:
         return o, pts_ids, op
 
     def optimize(self, iters=10, intrinsics=True, fit=("f", "cx", "cy", "k1", "k2", "k3", "p1", "p2"), huber=None,
-                 local=None):
+                 local=None, progress=None):
         """Bundle adjustment. local = list of camera indices to optimise (others fixed, only points they see).
         Runs on the GPU when CUDA is available."""
         o, pts_ids, op = self.ba_arrays()
@@ -333,7 +333,10 @@ class Reconstruction:
         hub = huber or 2.0 * self.px_scale(0)
         args = (self.rvec[regs], self.tvec[regs], self.X[pts_ids], self.intr, self.cam_sensor[regs],
                 cmap[self.o_img[o]], op, self.o_uv[o])
-        kw = dict(fixed_cams=fixed, intr_mask=mask, iters=iters, huber=hub, obs_w=self.o_w[o])
+        kw = dict(fixed_cams=fixed, intr_mask=mask, iters=iters, huber=hub, obs_w=self.o_w[o], progress=progress)
+        if progress:
+            log("  %s: %d cameras, %d points, %d observations, up to %d iterations on %s..." %
+                (progress, len(regs), len(pts_ids), len(o), iters, "GPU" if self.use_gpu else "CPU"))
         if pri is not None:
             kw.update(prior_idx=pri[0], prior_X=pri[1], prior_info=pri[2])
         if self.use_gpu:
@@ -446,13 +449,23 @@ class Reconstruction:
             last_global = 2
         log("  bundle adjustment on %s" % ("GPU" if self.use_gpu else "CPU"))
         self._grow(last_global, fit_intrinsics_after)
+        log("  all cameras that can be registered are in (%d/%d)" % (self.reg.sum(), self.n))
         if components:
+            log("  checking for photos that form a separate group (other video / area)...")
             self.align_components()
+        log("  re-triangulating tie points with the final camera set...")
         self.triangulate()
-        for _ in range(2):
-            self.optimize(iters=25, intrinsics=True)
+        import time as _t
+        for k in range(2):
+            t = _t.time()
+            self.optimize(iters=25, intrinsics=True, progress="final bundle adjustment %d/3" % (k + 1))
+            n0 = int(self.Xv.sum())
             self.filter(max_err_px=2.0)
-        info = self.optimize(iters=15, intrinsics=True)
+            log("  final bundle adjustment %d/3 done in %.0fs: rms %.2f px; removed outlier projections > 2 px (%d -> %d points)"
+                % (k + 1, _t.time() - t, self.last_info["final_rms"], n0, int(self.Xv.sum())))
+        t = _t.time()
+        info = self.optimize(iters=15, intrinsics=True, progress="final bundle adjustment 3/3")
+        log("  final bundle adjustment 3/3 done in %.0fs: rms %.2f px" % (_t.time() - t, info["final_rms"]))
         return info
 
     # ------------------------------------------------------------------ components / merge by markers
@@ -624,10 +637,13 @@ def align_photos(chunk, accuracy="high", max_features=10000, sequential_window=1
     ba_precision: None (keep current, default 'double') or 'mixed' (faster GPU bundle adjustment)."""
     t0 = time.time()
     _set_ba_precision(ba_precision)
-    log("Align Photos: detecting %s features (%s accuracy)" % (method, accuracy))
+    log("Align Photos [1/6] detecting %s features (%s accuracy) in %d photos (cached features are reused)"
+        % (method, accuracy, len(chunk.cameras)))
     method = F.detect_features(chunk, accuracy, max_features, force=reset_features, method=method)
+    log("Align Photos [2/6] choosing which photo pairs to match (sequence + retrieval for loop closures)")
     pairs = F.preselect_pairs(chunk, sequential_window, generic_k, retrieval=retrieval, cross_k=cross_k)
     log("  %d candidate pairs" % len(pairs))
+    log("Align Photos [3/6] matching %d pairs + geometric verification (cached matches are reused)" % len(pairs))
     F.match_features(chunk, pairs, force=reset_features)
     if use_markers:
         from . import markers as MK
@@ -635,15 +651,20 @@ def align_photos(chunk, accuracy="high", max_features=10000, sequential_window=1
             for c in chunk.cameras:
                 c.rvec = c.tvec = None           # detection below must not use a stale alignment
         if not any(m.get("auto") for m in chunk.markers or []):
-            log("  detecting coded targets before alignment (they tie videos together)")
+            log("Align Photos [4/6] detecting coded targets before alignment (they tie videos together)")
             MK.detect_markers(chunk, prealign=True)
+        else:
+            log("Align Photos [4/6] coded targets already detected - reused")
     else:
+        log("Align Photos [4/6] coded targets: skipped")
         chunk.markers = [m for m in chunk.markers or [] if not m.get("auto")]
+    log("Align Photos [5/6] building tracks and registering cameras (incremental SfM with bundle adjustment)")
     rec = Reconstruction(chunk)
     rec.load(F.load_matches(chunk))
     if reset:
         rec.clear_checkpoint()
     rec.run(resume=resume and not reset)
+    log("Align Photos [6/6] saving cameras, tie points and markers...")
     st = rec.save()
     rec.clear_checkpoint()
     region_from_sparse(chunk)
@@ -651,6 +672,7 @@ def align_photos(chunk, accuracy="high", max_features=10000, sequential_window=1
     if use_markers and chunk.markers:
         from . import markers as MK
         try:
+            log("  guided marker placement: looking for each target in the photos where its code was unreadable...")
             MK.refine_marker_projections(chunk)  # guided placement in photos where the code was unreadable
         except Exception as e:
             log("  guided marker placement skipped: %s" % e)

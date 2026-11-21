@@ -53,6 +53,8 @@ class MainWindow(QMainWindow):
                                       self.resizeDocks([self.photos_dock], [230], Qt.Vertical)))
 
         self.bridge = LogBridge(); self.bridge.line.connect(self.console.append_line)
+        self.bridge.line.connect(self._status_from_log)
+        self._task_title = None
         util.LOG_HOOKS.append(self.bridge.line.emit)
 
         self._build_actions()
@@ -289,12 +291,13 @@ class MainWindow(QMainWindow):
             self.project.save()
         for act in self.workflow_actions:
             act.setEnabled(False)
-        self.busy.show(); self.status(title + "…")
+        self.busy.show(); self.status(title + "…"); self._task_title = title
         self.console_dock.raise_()
         self.task = Task(fn, *a, **k)
 
         def finished(res, err):
             self.task = None
+            self._task_title = None
             self.busy.hide()
             for act in self.workflow_actions:
                 act.setEnabled(True)
@@ -316,6 +319,16 @@ class MainWindow(QMainWindow):
                 done(res)
         self.task.finished_with.connect(finished)
         self.task.start()
+
+    def _status_from_log(self, line):
+        """While a task runs, the status bar shows its latest progress line (the console may be hidden)."""
+        if self._task_title is None:
+            return
+        msg = line.split("] ", 1)[-1].strip()
+        if msg:
+            if len(msg) > 140:
+                msg = msg[:137] + "…"
+            self.status("%s…  —  %s" % (self._task_title, msg))
 
     def _need(self, what):
         if self.chunk is None:

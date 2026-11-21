@@ -198,8 +198,13 @@ def detect_markers(chunk, bits=12, min_radius=2.0, tolerance=0.3, cameras=None, 
     if fast_mode() and len(cams) > 8:
         # every photo is independent -> process pool; results are merged below in the original order
         from concurrent.futures import ProcessPoolExecutor
+        log("  searching %d photos for coded targets on %d CPU workers..." % (len(paths), n_workers()))
+        dets = []
         with ProcessPoolExecutor(n_workers()) as ex:
-            dets = list(ex.map(_detect_job, [(p, bits, min_radius, tolerance) for p in paths], chunksize=4))
+            for k, d in enumerate(ex.map(_detect_job, [(p, bits, min_radius, tolerance) for p in paths], chunksize=4)):
+                dets.append(d)
+                if (k + 1) % max(1, len(paths) // 10) == 0:
+                    log("  coded targets: %d/%d photos searched" % (k + 1, len(paths)))
     else:
         dets = [_detect_job((p, bits, min_radius, tolerance)) for p in paths]
     for k, i in enumerate(cams):
@@ -315,10 +320,16 @@ def refine_marker_projections(chunk, search_px=12, labels=None):
                 continue
             per_cam.setdefault(i, []).append((mi, u, v))
     jobs = [(chunk.abspath(chunk.cameras[i]), items, search_px) for i, items in per_cam.items()]
+    log("  guided placement: %d markers, %d predicted positions in %d photos to check" %
+        (len(ms), sum(len(v) for v in per_cam.values()), len(jobs)))
     if len(jobs) > 8:
         from concurrent.futures import ProcessPoolExecutor
+        res = []
         with ProcessPoolExecutor(n_workers()) as ex:
-            res = list(ex.map(_snap_job, jobs, chunksize=4))
+            for k, r in enumerate(ex.map(_snap_job, jobs, chunksize=4)):
+                res.append(r)
+                if (k + 1) % max(1, len(jobs) // 10) == 0:
+                    log("  guided placement: %d/%d photos checked" % (k + 1, len(jobs)))
     else:
         res = [_snap_job(j) for j in jobs]
     found = {}

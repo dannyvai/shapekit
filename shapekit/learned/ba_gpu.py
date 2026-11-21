@@ -54,7 +54,7 @@ def _jac_transform():
 def bundle_adjust_gpu(cam_r, cam_t, pts, intr, cam_sensor, obs_cam, obs_pt, obs_uv,
                       fixed_cams=None, intr_mask=None, iters=10, huber=2.0, verbose=False, tol=1e-6,
                       pair_chunk=100_000, obs_chunk=100_000,
-                      obs_w=None, prior_idx=None, prior_X=None, prior_info=None, precision=None):
+                      obs_w=None, prior_idx=None, prior_X=None, prior_info=None, precision=None, progress=None):
     """precision: 'double' (default, everything float64) or 'mixed': Jacobians and Schur-complement blocks in
     float32 (consumer GPUs run fp64 at 1/32-1/64 speed), accumulation, solve, residuals and the LM acceptance
     test in float64 -- steps are slightly less exact, the cost that is minimised is the same."""
@@ -227,6 +227,9 @@ def bundle_adjust_gpu(cam_r, cam_t, pts, intr, cam_sensor, obs_cam, obs_pt, obs_
                 break
             lam *= 6
         info["iterations"] = it + 1
+        if progress:
+            from ..util import log
+            log("    %s: iteration %d/%d, rms %.3f px" % (progress, it + 1, iters, float(torch.sqrt((r ** 2).sum(1).mean()))))
         if verbose:
             print("  GPU BA it %d cost %.4g rms %.3f lam %.1e" % (it, float(cost), float(torch.sqrt((r ** 2).sum(1).mean())), lam))
         if not accepted or rel < tol:

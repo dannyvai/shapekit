@@ -123,6 +123,7 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
             vis_rgb[k] = (vis, pu_k, pv_k)
         if k % 10 == 0:
             log("  visibility %d/%d" % (k + 1, len(cams)))
+    log("  choosing the best photo for every face and smoothing the choice between neighbours...")
     S = sp.csr_matrix((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(nf, len(cams)))
     best = np.asarray(S.argmax(axis=1)).ravel()
     bestv = np.asarray(S.max(axis=1).todense()).ravel()
@@ -154,6 +155,7 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
     # ---- colour correction: per camera gain vs mesh vertex colours (median ratio)
     gains = np.ones((len(cams), 3))
     if color_correction and VC is not None:
+        log("  colour correction: matching the brightness of %d photos..." % len(cams))
         ref = VC[F].mean(1).astype(np.float64) + 1
 
         def gain(k):
@@ -213,6 +215,7 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
         s *= 0.93
     log("  atlas %dx%d, chart scale %.3f" % (size, size, s))
     atlas = np.full((size, size, 3), 127, np.uint8)
+    log("  copying texture patches from %d photos into the atlas..." % len(cams))
     # gray patch for unlabelled faces
 
     def fill(k):
@@ -242,7 +245,9 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
         # charts own disjoint atlas rectangles, so cameras can be filled concurrently
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(n_workers(8)) as ex:
-            list(ex.map(fill, range(len(cams))))
+            for k, _ in enumerate(ex.map(fill, range(len(cams)))):
+                if (k + 1) % max(1, len(cams) // 5) == 0:
+                    log("  atlas: %d/%d photos copied" % (k + 1, len(cams)))
     else:
         for k in range(len(cams)):
             fill(k)
@@ -252,6 +257,7 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
     c_of = chart[fl]
     uv_px[fl] = (corner_uv_px[fl] - boxes[c_of, None, :2]) * s + np.array(pos)[c_of][:, None, :]
     if blending == "multiband":
+        log("  multiband blending: sampling every photo to level seams and exposure steps...")
         _seam_leveling(chunk, V, F, cams, label, S, vis_rgb, gains, vis_scale, atlas, uv_px, fl)
     uv_px[~fl] = [2, 2]
     atlas[0:5, 0:5] = 127
@@ -260,6 +266,7 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
     face_uv = np.arange(nf * 3).reshape(nf, 3)
     out = chunk.path("model", "model.obj")
     tex = chunk.path("model", "model_texture.jpg")
+    log("  writing the texture image (%dx%d JPG) and model.obj..." % (size, size))
     cv2.imwrite(tex, atlas[:, :, ::-1] if False else atlas, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
     write_obj(out, V, F, UV, face_uv, texture_file=tex)
     np.savez_compressed(chunk.path("model", "uv.npz"), uv=UV.astype(np.float32), face_uv=face_uv)

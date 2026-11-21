@@ -38,6 +38,7 @@ def build_mesh(chunk, face_count="medium", voxel_size=None, trunc_vox=4, min_wei
     trunc = trunc_vox * vox
 
     # ---- narrow band from depth-map samples
+    log("  finding the surface band from the depth maps...")
     occ = np.zeros(dims, bool)
 
     def band_cells(i):
@@ -140,6 +141,7 @@ def build_mesh(chunk, face_count="medium", voxel_size=None, trunc_vox=4, min_wei
     mask.flat[bi[obs]] = True
     colvol_idx = -np.ones(dims, np.int64)
     colvol_idx.flat[bi] = np.arange(len(bi))
+    log("  extracting the surface (marching cubes)...")
     verts, faces, _, _ = marching_cubes(vol, 0.0, mask=mask, allow_degenerate=False)
     # skimage winding already gives normals pointing to the observed (positive) side
     faces = faces[:, :]
@@ -160,9 +162,11 @@ def build_mesh(chunk, face_count="medium", voxel_size=None, trunc_vox=4, min_wei
     Lv = (verts + 0.5) * vox + origin
     V = Lv @ R + c
     log("  marching cubes: %d vertices, %d faces" % (len(V), len(faces)))
+    log("  removing small floating pieces and smoothing...")
     V, faces, vcol = remove_small_components(V, faces, vcol, component_filter)
     if smooth_iters:
         V = taubin_smooth(V, faces, smooth_iters)
+    log("  writing mesh.ply...")
     write_ply(chunk.path("mesh.ply"), V, faces=faces, colors=vcol.clip(0, 255).astype(np.uint8))
     chunk.stats["mesh"] = dict(vertices=int(len(V)), faces=int(len(faces)), voxel=float(vox))
     chunk.add_log("Build Mesh", time.time() - t0, faces=int(len(faces)), voxel=float(vox))

@@ -324,20 +324,37 @@ def cmd_process(a):
     if gpu_available():
         dq = GPU_DEPTH[a.preset]
     seq, gen = (12, 10) if method != "sift" else (10, 12)
+    steps = ["Align Photos", "Build Depth Maps"] + ([] if a.no_cloud else ["Build Point Cloud"]) + ["Build Mesh"]
+    steps += (["Close Holes"] if getattr(a, "close_holes", 0) else []) + (["Refine Mesh"] if getattr(a, "refine", False) else [])
+    steps += ["Build Texture", "Export + Report"] + (["Fly-through Video"] if getattr(a, "flythrough", None) else [])
+
+    def stage(name):
+        log("========== Batch step %d/%d: %s ==========" % (steps.index(name) + 1, len(steps), name))
+    stage("Align Photos")
     if not ch.aligned_cameras():
         align_photos(ch, acc, kp, seq, gen, method=method, use_markers=not a.no_markers); p.save()
+    else:
+        log("  photos already aligned (%d cameras) - skipped" % len(ch.aligned_cameras()))
+    stage("Build Depth Maps")
     build_depth_maps(ch, dq, filt, workers=a.workers, method=getattr(a, "depth_method", "planesweep")); p.save()
     if not a.no_cloud:
+        stage("Build Point Cloud")
         build_point_cloud(ch); p.save()
+    stage("Build Mesh")
     build_mesh(ch, fc); p.save()
     if getattr(a, "close_holes", 0):
+        stage("Close Holes")
         from .mesh import close_holes_chunk
         close_holes_chunk(ch, a.close_holes); p.save()
     if getattr(a, "refine", False):
+        stage("Refine Mesh")
         from .mesh import refine_mesh
         refine_mesh(ch); p.save()
+    stage("Build Texture")
     build_texture(ch, tex, blending=getattr(a, "blending", "mosaic")); p.save()
+    stage("Export + Report")
     out = os.path.join(p.dir, "exports")
+    log("Exporting model (OBJ + GLB), point cloud, cameras and markers to %s..." % out)
     export_model(ch, os.path.join(out, "model.obj"))
     export_model(ch, os.path.join(out, "model.glb"), texture_size=4096)
     if not a.no_cloud:
@@ -346,8 +363,10 @@ def cmd_process(a):
     if ch.markers:
         from .export import export_markers
         export_markers(ch, os.path.join(out, "markers.csv"))
+    log("Generating the HTML report (renders, statistics, 3D viewer)...")
     generate_report(ch)
     if getattr(a, "flythrough", None):
+        stage("Fly-through Video")
         from .flythrough import run_external
         try:                                   # separate process: VTK off-screen rendering
             run_external(p.dir, a.chunk, os.path.join(out, "flythrough_%s.mp4" % a.flythrough), pattern=a.flythrough)
