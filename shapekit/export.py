@@ -81,9 +81,22 @@ def export_model(chunk, path, max_faces=None, texture_size=None, local_frame=Fal
     return path
 
 
+def _big(path, limit=30_000_000):
+    from .io import ply_vertex_count
+    try:
+        return ply_vertex_count(path) > limit
+    except Exception:
+        return False
+
+
 def export_points(chunk, path, source="dense"):
     src = chunk.path("point_cloud.ply") if source == "dense" else None
-    if source == "dense" and os.path.exists(src):
+    if source == "dense" and os.path.exists(src) and _big(src):
+        # large clouds: stream block by block instead of loading everything (same output)
+        from .io import transform_ply_stream
+        transform_ply_stream(src, path, lambda P: world(chunk, P),
+                             (lambda N: world_normals(chunk, N)) if world_normals(chunk, np.zeros((1, 3))) is not None else None)
+    elif source == "dense" and os.path.exists(src):
         d = read_ply(src)
         write_ply(path, world(chunk, d["verts"]), colors=d.get("colors"), normals=world_normals(chunk, d.get("normals")),
                   extra={"confidence": d["confidence"]} if "confidence" in d else None)

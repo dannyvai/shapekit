@@ -43,6 +43,73 @@ def write_ply(path, verts, faces=None, colors=None, normals=None, extra=None):
             f.write(fa.tobytes())
 
 
+def ply_header(path):
+    """(vertex dtype, n_vertices, n_faces, header byte length) of a binary PLY."""
+    with open(path, "rb") as f:
+        hdr = []
+        while True:
+            line = f.readline().decode().strip()
+            hdr.append(line)
+            if line == "end_header":
+                break
+        off = f.tell()
+    tmap = {"float": "<f4", "uchar": "u1", "int": "<i4", "uint": "<u4", "double": "<f8", "ushort": "<u2"}
+    nv = nf = 0; fields = []; cur = None
+    for l in hdr:
+        p = l.split()
+        if p[:2] == ["element", "vertex"]:
+            nv = int(p[2]); cur = "v"
+        elif p[:2] == ["element", "face"]:
+            nf = int(p[2]); cur = "f"
+        elif p and p[0] == "property" and cur == "v":
+            fields.append((p[2], tmap[p[1]]))
+    return np.dtype(fields), nv, nf, off
+
+
+def ply_vertex_count(path):
+    return ply_header(path)[1]
+
+
+def read_ply_sampled(path, max_points):
+    """Every k-th vertex of a (possibly huge) point-cloud PLY via a memory map, at most ~max_points.
+    Returns the same dict as read_ply plus 'stride'."""
+    dt, nv, nf, off = ply_header(path)
+    if nv <= max_points or nf:
+        d = read_ply(path); d["stride"] = 1
+        return d
+    k = int(np.ceil(nv / max_points))
+    v = np.array(np.memmap(path, dtype=dt, mode="r", offset=off, shape=(nv,))[::k])
+    out = dict(verts=np.stack([v["x"], v["y"], v["z"]], 1).astype(np.float64), faces=None, stride=k)
+    if "red" in v.dtype.names:
+        out["colors"] = np.stack([v["red"], v["green"], v["blue"]], 1)
+    if "nx" in v.dtype.names:
+        out["normals"] = np.stack([v["nx"], v["ny"], v["nz"]], 1)
+    for name in v.dtype.names:
+        if name not in ("x", "y", "z", "nx", "ny", "nz", "red", "green", "blue"):
+            out[name] = np.array(v[name])
+    return out
+
+
+def transform_ply_stream(src, dst, fn_points, fn_normals=None, block=4_000_000):
+    """Copy a vertex-only PLY applying fn_points (N,3)->(N,3) (and fn_normals) block by block (constant memory)."""
+    dt, nv, nf, off = ply_header(src)
+    if nf:
+        raise ValueError("transform_ply_stream: vertex-only PLY expected")
+    with open(src, "rb") as f:
+        header = f.read(off)
+    mm = np.memmap(src, dtype=dt, mode="r", offset=off, shape=(nv,))
+    with open(dst, "wb") as f:
+        f.write(header)
+        for a in range(0, nv, block):
+            v = np.array(mm[a:a + block])
+            P = fn_points(np.stack([v["x"], v["y"], v["z"]], 1).astype(np.float64)).astype(np.float32)
+            v["x"], v["y"], v["z"] = P.T
+            if fn_normals is not None and "nx" in v.dtype.names:
+                N = fn_normals(np.stack([v["nx"], v["ny"], v["nz"]], 1)).astype(np.float32)
+                v["nx"], v["ny"], v["nz"] = N.T
+            f.write(v.tobytes())
+
+
 def read_ply(path):
     with open(path, "rb") as f:
         hdr = []

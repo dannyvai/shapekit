@@ -68,8 +68,9 @@ class ModelView(QWidget):
             elif layer == "dense":
                 p = os.path.join(ch.dir, "point_cloud.ply")
                 if os.path.exists(p):
-                    r = read_ply(p)
-                    d = dict(P=r["verts"], C=r.get("colors"))
+                    from ..io import read_ply_sampled
+                    r = read_ply_sampled(p, 6_000_000)        # huge clouds: every k-th point for display
+                    d = dict(P=r["verts"], C=r.get("colors"), stride=r.get("stride", 1))
             elif layer == "mesh":
                 p = os.path.join(ch.dir, "mesh.ply")
                 if os.path.exists(p):

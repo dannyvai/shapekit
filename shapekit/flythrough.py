@@ -170,7 +170,8 @@ def _scene(pl, chunk, display):
                 pl.add_mesh(m, color="#d9d4c7", smooth_shading=True, specular=0.15)
     else:
         if os.path.exists(cloud_p):
-            r = read_ply(cloud_p); P, C = r["verts"], r.get("colors")
+            from .io import read_ply_sampled
+            r = read_ply_sampled(cloud_p, 8_000_000); P, C = r["verts"], r.get("colors")
         else:
             sp = chunk.load_sparse(); P, C = sp["points"], sp["colors"]
         step = max(1, len(P) // 6_000_000)

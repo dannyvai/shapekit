@@ -718,6 +718,11 @@ class MainWindow(QMainWindow):
         if layer == "tie":
             edit.delete_tie_points(self.chunk, m)
         elif layer == "dense":
+            if (self.model.data.get("dense") or {}).get("stride", 1) > 1:
+                QMessageBox.information(self, "Delete points", "The view shows a subsample of this very large point "
+                                        "cloud, so points can't be deleted one by one. Crop with the region box and "
+                                        "rebuild the point cloud instead.")
+                return
             edit.delete_dense_points(self.chunk, m)
         else:
             edit.delete_faces(self.chunk, m)
@@ -751,7 +756,11 @@ class MainWindow(QMainWindow):
         v = ParamDialog.ask("Filter by confidence", [("c", "Select points with confidence below", "int", 3, (1, 255))], self)
         if v is None:
             return
-        from ..io import read_ply
+        from ..io import read_ply, ply_vertex_count
+        if ply_vertex_count(self.chunk.path("point_cloud.ply")) > 30_000_000:
+            QMessageBox.information(self, "Filter by confidence", "This point cloud is too large to edit point by point. "
+                                    "Use the region box (Edit Region) and rebuild, or build the mesh from depth maps.")
+            return
         d = read_ply(self.chunk.path("point_cloud.ply"))
         if "confidence" in d:
             self.set_display("Point cloud")

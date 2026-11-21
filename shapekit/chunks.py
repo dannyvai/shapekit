@@ -228,6 +228,16 @@ def merge_chunks(project, idxs, label="Merged Chunk", merge_markers=True, merge_
                     n["_pos"] = [pos] if pos is not None else []
                     mk[m["label"]] = n
         if merge_cloud and os.path.exists(os.path.join(ch.dir, "point_cloud.ply")):
+            from .io import ply_vertex_count
+            if ply_vertex_count(os.path.join(ch.dir, "point_cloud.ply")) > 30_000_000:
+                log("  point cloud of '%s' is very large - not merged; build the point cloud of the merged chunk "
+                    "from its merged depth maps instead" % ch.label)
+                merge_cloud = False
+                cloud = []
+                continue_cloud = False
+            else:
+                continue_cloud = True
+        if merge_cloud and os.path.exists(os.path.join(ch.dir, "point_cloud.ply")) and continue_cloud:
             pc = read_ply(os.path.join(ch.dir, "point_cloud.ply"))
             P = pc["verts"] @ S[:3, :3].T + S[:3, 3]
             N = pc["normals"] @ (S[:3, :3] / s).T if "normals" in pc else None

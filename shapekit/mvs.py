@@ -155,6 +155,7 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
                      workers=None, gpu=None, method="planesweep"):
     """method: 'planesweep' (fronto-parallel sweep, default) or 'patchmatch' (slanted planes with normals)."""
     t0 = time.time()
+    prev_filter = (chunk.stats.get("depth_maps") or {}).get("filter")
     scale = QUALITY[quality]
     nbmap = select_neighbors(chunk, n_neighbors)
     aligned = chunk.aligned_cameras()
@@ -236,9 +237,16 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
         for k, jb in enumerate(jobs):
             log("  depth map %d/%d %s" % (k + 1, len(jobs), _depth_job(jb, view)))
     chunk.stats["depth_maps"] = dict(quality=quality, filter=filter_mode, cameras=len(aligned), method=method)
-    log("  depth maps done; filtering (%s): keeping only depths confirmed by %d+ neighbouring photos..." %
-        (filter_mode, FILTER[filter_mode]))
-    filter_depth_maps(chunk, filter_mode, nbmap, views=view)
+    from .util import fast_mode
+    have_f = all(os.path.exists(chunk.path("depth", "%05d_f.npz" % i)) for i in aligned
+                 if os.path.exists(chunk.path("depth", "%05d.npz" % i)))
+    if not jobs and not force and have_f and prev_filter == filter_mode and fast_mode():
+        log("  all depth maps and their %s filtering already exist - reused (tick 'Recompute existing' to redo)"
+            % filter_mode)
+    else:
+        log("  depth maps done; filtering (%s): keeping only depths confirmed by %d+ neighbouring photos..." %
+            (filter_mode, FILTER[filter_mode]))
+        filter_depth_maps(chunk, filter_mode, nbmap, views=view)
     chunk.add_log("Build Depth Maps", time.time() - t0, quality=quality, filter=filter_mode, method=method)
 
 
@@ -420,6 +428,9 @@ def build_point_cloud(chunk, point_spacing=None, stride=1, min_conf=0):
     from .util import fast_mode, n_workers
     cams = chunk.aligned_cameras()
     log("Build Point Cloud: back-projecting %d filtered depth maps into 3D (with colours and normals)..." % len(cams))
+    est = _estimate_raw_points(chunk, cams)
+    if fast_mode() and est > STREAM_POINTS:
+        return _build_point_cloud_streaming(chunk, cams, stride, point_spacing, min_conf, est, t0)
     if fast_mode():
         from concurrent.futures import ThreadPoolExecutor
         outs = []
@@ -453,6 +464,121 @@ def build_point_cloud(chunk, point_spacing=None, stride=1, min_conf=0):
     return P, Cc, N, Q
 
 
+STREAM_POINTS = 40_000_000      # above this many raw points the cloud is fused out-of-core
+
+
+def _estimate_raw_points(chunk, cams):
+    for i in cams[:: max(1, len(cams) // 10)]:
+        d = load_depth(chunk, i)
+        if d is not None:
+            return int(len(cams) * d["depth"].size * 0.7)
+    return 0
+
+
+def _build_point_cloud_streaming(chunk, cams, stride, point_spacing, min_conf, est, t0):
+    """Out-of-core fusion for big projects (constant memory, identical result to the in-memory path).
+    Pass 1 back-projects views in order and appends the points to slab files on disk (slabs = ranges of the
+    first voxel index); pass 2 voxel-merges each slab with the global voxel origin, so voxels never straddle
+    slabs and the concatenated slabs are in the same order as one global merge; the PLY is written streaming."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor
+    from .util import n_workers
+    if point_spacing is None:
+        point_spacing = estimate_gsd(chunk, None) * 1.0
+    size = point_spacing
+    tmp = chunk.path("_cloud_tmp")
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp)
+    # slab ranges over the first voxel index, from the region (or tie points)
+    if chunk.region:
+        c, s, R = region_box(chunk)
+        corners = c + (np.array([[i, j, k] for i in (-.5, .5) for j in (-.5, .5) for k in (-.5, .5)]) * s) @ R
+    else:
+        corners = chunk.load_sparse()["points"]
+    k0lo = int(np.floor(corners[:, 0].min() / size)) - 1
+    k0hi = int(np.floor(corners[:, 0].max() / size)) + 1
+    nslab = int(np.clip(np.ceil(est / 12e6), 2, 256))
+    log("  large cloud (~%s raw points): fusing out-of-core in %d slabs (temporary files in %s)" %
+        ("{:,}".format(est), nslab, tmp))
+    files = [[open(os.path.join(tmp, "%03d_%s.bin" % (k, f)), "wb") for f in "PCNQ"] for k in range(nslab)]
+    counts = np.zeros(nslab, np.int64)
+    kmin = np.array([np.iinfo(np.int64).max] * 3); kmax = np.array([np.iinfo(np.int64).min] * 3)
+    total = 0
+    batch = max(4, n_workers(8) * 2)
+    with ThreadPoolExecutor(n_workers(8)) as ex:
+        done = 0
+        for b0 in range(0, len(cams), batch):                 # bounded batches keep memory constant
+            for o in ex.map(lambda i: _cloud_view(chunk, i, stride), cams[b0:b0 + batch]):
+                done += 1
+                if o is None:
+                    continue
+                P, Cc, N, Q = crop_to_region(chunk, o[0], o[1], o[2], o[3])
+                if len(P) == 0:
+                    continue
+                key = np.floor(P / size).astype(np.int64)
+                kmin = np.minimum(kmin, key.min(0)); kmax = np.maximum(kmax, key.max(0))
+                sl = np.clip((key[:, 0] - k0lo) * nslab // max(1, k0hi - k0lo + 1), 0, nslab - 1)
+                for k in np.unique(sl):
+                    m = sl == k
+                    fs = files[k]
+                    fs[0].write(np.ascontiguousarray(P[m], np.float32).tobytes())
+                    fs[1].write(np.ascontiguousarray(Cc[m], np.uint8).tobytes())
+                    fs[2].write(np.ascontiguousarray(N[m], np.float32).tobytes())
+                    fs[3].write(np.ascontiguousarray(Q[m], np.uint8).tobytes())
+                    counts[k] += m.sum()
+                total += len(P)
+            log("  %d/%d depth maps back-projected (%s points so far)" % (done, len(cams), "{:,}".format(total)))
+    for fs in files:
+        for f in fs:
+            f.close()
+    log("  merging %s raw points on a %.4g grid, slab by slab (duplicates from overlapping photos are averaged)..."
+        % ("{:,}".format(total), size))
+    dims = kmax - kmin + 1
+    fields = [("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("nx", "<f4"), ("ny", "<f4"), ("nz", "<f4"),
+              ("red", "u1"), ("green", "u1"), ("blue", "u1"), ("confidence", "u1")]
+    merged = []
+    n_out = 0
+    for k in range(nslab):
+        if counts[k] == 0:
+            continue
+        base = os.path.join(tmp, "%03d_" % k)
+        P = np.fromfile(base + "P.bin", np.float32).reshape(-1, 3)
+        Cc = np.fromfile(base + "C.bin", np.uint8).reshape(-1, 3)
+        N = np.fromfile(base + "N.bin", np.float32).reshape(-1, 3)
+        Q = np.fromfile(base + "Q.bin", np.uint8)
+        Pm, Cm, Nm, Qm = voxel_merge(P, Cc, N, Q, size, kmin, dims)
+        del P, Cc, N, Q
+        if min_conf:
+            m = Qm >= min_conf
+            Pm, Cm, Nm, Qm = Pm[m], Cm[m], Nm[m], Qm[m]
+        arr = np.zeros(len(Pm), dtype=fields)
+        arr["x"], arr["y"], arr["z"] = Pm.T
+        arr["nx"], arr["ny"], arr["nz"] = Nm.T
+        arr["red"], arr["green"], arr["blue"] = Cm[:, 0], Cm[:, 1], Cm[:, 2]
+        arr["confidence"] = Qm.astype(np.uint8)
+        mp = base + "merged.bin"
+        arr.tofile(mp)
+        merged.append(mp); n_out += len(arr)
+        for f in "PCNQ":
+            os.remove(base + f + ".bin")
+        log("  slab %d/%d merged: %s points" % (k + 1, nslab, "{:,}".format(len(arr))))
+    tmap = {"<f4": "float", "u1": "uchar"}
+    hdr = ["ply", "format binary_little_endian 1.0", "element vertex %d" % n_out]
+    hdr += ["property %s %s" % (tmap[t], name) for name, t in fields]
+    hdr.append("end_header")
+    log("  writing point_cloud.ply (%s points)..." % "{:,}".format(n_out))
+    with open(chunk.path("point_cloud.ply"), "wb") as f:
+        f.write(("\n".join(hdr) + "\n").encode())
+        for mp in merged:
+            with open(mp, "rb") as g:
+                shutil.copyfileobj(g, f, 64 << 20)
+    shutil.rmtree(tmp, ignore_errors=True)
+    chunk.stats["point_cloud"] = dict(points=int(n_out), spacing=float(point_spacing))
+    chunk.add_log("Build Point Cloud", time.time() - t0, points=int(n_out))
+    log("Point cloud: %d points (spacing %.4g)" % (n_out, point_spacing))
+    return None, None, None, None
+
+
 def estimate_gsd(chunk, scale):
     """Median ground sampling distance (world units per depth-map pixel)."""
     vals = []
@@ -480,10 +606,12 @@ def crop_to_region(chunk, P, *others):
     return (P[m],) + tuple(o[m] for o in others)
 
 
-def voxel_merge(P, C, N, Q, size):
+def voxel_merge(P, C, N, Q, size, kmin=None, dims=None):
+    """Average all points falling in the same voxel. kmin / dims: global voxel-index origin and extent when
+    merging one slab of a larger cloud (gives exactly the global result, in the global order)."""
     key = np.floor(P / size).astype(np.int64)
-    key -= key.min(0)
-    dims = key.max(0) + 1
+    key -= key.min(0) if kmin is None else kmin
+    dims = key.max(0) + 1 if dims is None else dims
     lin = (key[:, 0] * dims[1] + key[:, 1]) * dims[2] + key[:, 2]
     uniq, inv, cnt = np.unique(lin, return_inverse=True, return_counts=True)
     def avg(a):
