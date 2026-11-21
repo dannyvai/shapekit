@@ -40,6 +40,17 @@ def _proj_single(r, t, X, I):
 PRECISION = __import__("os").environ.get("SHAPEKIT_BA_PRECISION", "double")   # double | mixed
 
 
+def _jac_transform():
+    """Forward-mode jacfwd normally. In the frozen (PyInstaller) app forward-mode AD can't start: its first use
+    imports torch._decomp.decompositions_for_jvp, which TorchScript-compiles functions and needs Python source
+    files that a frozen app doesn't ship. Reverse mode (jacrev) gives the same derivatives without that."""
+    import sys
+    from torch.func import jacfwd, jacrev
+    if getattr(sys, "frozen", False) or __import__("os").environ.get("SHAPEKIT_BA_JACREV"):
+        return jacrev
+    return jacfwd
+
+
 def bundle_adjust_gpu(cam_r, cam_t, pts, intr, cam_sensor, obs_cam, obs_pt, obs_uv,
                       fixed_cams=None, intr_mask=None, iters=10, huber=2.0, verbose=False, tol=1e-6,
                       pair_chunk=100_000, obs_chunk=100_000,
@@ -95,7 +106,7 @@ def bundle_adjust_gpu(cam_r, cam_t, pts, intr, cam_sensor, obs_cam, obs_pt, obs_
     pair_b = order[st_a + within]
     npairs = len(pair_a)
 
-    jac = vmap(jacfwd(_proj_single, argnums=(0, 1, 2, 3)))
+    jac = vmap(_jac_transform()(_proj_single, argnums=(0, 1, 2, 3)))
     proj = vmap(_proj_single)
 
     def residuals(cr, ct, P, I):
