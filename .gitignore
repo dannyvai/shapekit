@@ -1,0 +1,29 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+*.egg-info
+wheels/
+
+# Virtual environment
+.venv/
+
+# Portable build outputs (build_portable.bat)
+build/
+dist/
+models/
+
+# Input footage and processed projects (large, local data)
+videos/
+demo/
+projects/
+exports/
+
+# Logs and run markers
+*.log
+*.done
+
+# Editor / OS clutter
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
