@@ -38,7 +38,12 @@ def main(project=None):
         img = (np.random.default_rng(0).random((480, 640, 3)) * 255).astype("uint8")
         f = lf.extract(img)
         m, _ = lf.match((f["xy"], f["desc"]), (f["xy"], f["desc"]), (640, 480), (640, 480))
-        return "ALIKED %d keypoints, LightGlue %d self-matches" % (len(f["xy"]), len(m))
+        s = "ALIKED %d keypoints, LightGlue %d self-matches" % (len(f["xy"]), len(m))
+        mm = lf.memory_model()
+        if mm:
+            s += "; GPU memory %.0f MB + %.2f KB/pixel -> up to %.1f MP at native size right now" % (
+                mm[0] / 1e6, mm[1] / 1e3, lf.max_pixels() / 1e6)
+        return s
     item("ALIKED + LightGlue", feats)
 
     def retr():

@@ -65,6 +65,36 @@ class LearnedFeatures:
                                  filter_threshold=0.1, mp=bool(fp16 and self.dev.type == "cuda"),
                                  flash=True).eval().to(self.dev)
 
+    def memory_model(self):
+        """(fixed bytes, bytes per pixel) of one extraction on this GPU, measured once on two synthetic images
+        (peak allocated memory is linear in the pixel count for these fully-convolutional detectors)."""
+        if getattr(self, "_mem_model", None) is not None or self.dev.type != "cuda":
+            return getattr(self, "_mem_model", None)
+        torch = self.torch
+        pts = []
+        for w, h in ((640, 480), (1280, 960)):
+            img = (np.random.default_rng(0).random((h, w, 3)) * 255).astype(np.uint8)
+            torch.cuda.synchronize(); base = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            self.extract(img, resize=None)
+            torch.cuda.synchronize()
+            pts.append((w * h, torch.cuda.max_memory_allocated() - base))
+        (p0, m0), (p1, m1) = pts
+        per_px = max((m1 - m0) / (p1 - p0), 1.0)
+        self._mem_model = (max(m0 - per_px * p0, 0.0), per_px)
+        return self._mem_model
+
+    def max_pixels(self, margin=0.7):
+        """Largest image (in pixels) that fits in `margin` of the GPU memory free right now; None on CPU."""
+        mm = self.memory_model()
+        if mm is None:
+            return None
+        torch = self.torch
+        free, _ = torch.cuda.mem_get_info()
+        free += torch.cuda.memory_reserved() - torch.cuda.memory_allocated()     # cached blocks are reusable
+        fixed, per_px = mm
+        return max(int((margin * free - fixed) / per_px), 640 * 480)
+
     def extract(self, img_bgr, resize="default"):
         """img_bgr uint8 HxWx3 -> dict(xy (N,2) float32 in full-res pixel coords, desc (N,D) float16, score).
         resize: longest side the network sees (None = native); "default" = the value given at construction."""
