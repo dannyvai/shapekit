@@ -18,6 +18,7 @@
   python -m shapekit masks    PROJECT ai [--groups people vehicles] | import DIR [--pattern ...] | clear
   python -m shapekit refine-mesh PROJECT [--iterations 3]
   python -m shapekit close-holes PROJECT [--max-edges 200]
+  python -m shapekit flythrough PROJECT [--pattern orbit|helix|flyover|reveal|topdown|capture] [--seconds 20]
   python -m shapekit chunks   PROJECT list | add [--label L] | duplicate I | remove I
                               | align REF I [I ...] [--by markers|cameras] | merge I I [...] [--label L]
 """
@@ -283,6 +284,17 @@ def cmd_chunks(a):
     p.save()
 
 
+def cmd_flythrough(a):
+    from .flythrough import render_flythrough
+    p, ch = _open(a)
+    w, h = (a.size.lower().split("x") if "x" in a.size.lower() else (None, None))
+    size = (int(w), int(h)) if w else a.size.lower()
+    start = a.start_angle if a.start_angle == "auto" else float(a.start_angle)
+    render_flythrough(ch, a.out, a.pattern, a.seconds, a.fps, size, a.elevation, a.distance, a.display, start,
+                      a.crf, arc=a.arc)
+    p.save()
+
+
 def cmd_process(a):
     acc, kp, dq, filt, fc, tex = PRESETS[a.preset]
     if not os.path.exists(os.path.join(a.project, Project.FILE)):
@@ -335,6 +347,12 @@ def cmd_process(a):
         from .export import export_markers
         export_markers(ch, os.path.join(out, "markers.csv"))
     generate_report(ch)
+    if getattr(a, "flythrough", None):
+        from .flythrough import run_external
+        try:                                   # separate process: VTK off-screen rendering
+            run_external(p.dir, a.chunk, os.path.join(out, "flythrough_%s.mp4" % a.flythrough), pattern=a.flythrough)
+        except Exception as e:
+            log("  fly-through video skipped: %s" % e)
     log("All done in %.1f min -> %s" % ((time.time() - t_all) / 60, out))
 
 
@@ -395,6 +413,16 @@ def main(argv=None):
     s.add_argument("--dilate", type=int, default=12)
     s = sp("refine-mesh", cmd_refine_mesh); s.add_argument("--iterations", type=int, default=3)
     s = sp("close-holes", cmd_close_holes); s.add_argument("--max-edges", type=int, default=200)
+    s = sp("flythrough", cmd_flythrough, help="render a drone-style fly-through video (MP4) of the model")
+    s.add_argument("--pattern", default="orbit", choices=["orbit", "helix", "flyover", "reveal", "topdown", "capture"])
+    s.add_argument("--seconds", type=float, default=20.0); s.add_argument("--fps", type=int, default=30)
+    s.add_argument("--size", default="1080p", help="480p, 720p, 1080p, 1440p, 4k or WxH")
+    s.add_argument("--elevation", type=float, default=30.0, help="camera elevation angle in degrees")
+    s.add_argument("--distance", type=float, default=1.0, help="distance factor (1 = site fills the frame)")
+    s.add_argument("--display", default="auto", choices=["auto", "textured", "colours", "shaded", "points"])
+    s.add_argument("--start-angle", default="auto", help="degrees, or auto = from the side the photos were taken")
+    s.add_argument("--arc", type=float, default=360.0, help="orbit sweep in degrees (e.g. 180 for one-sided scans)")
+    s.add_argument("--crf", type=int, default=18); s.add_argument("--out", default=None)
     s = sp("chunks", cmd_chunks)
     s.add_argument("action", choices=["list", "add", "duplicate", "remove", "align", "merge"])
     s.add_argument("idx", nargs="*", type=int); s.add_argument("--label", default=None)
@@ -429,6 +457,8 @@ def main(argv=None):
     s.add_argument("--blending", default="mosaic", choices=["mosaic", "multiband"])
     s.add_argument("--close-holes", type=int, default=0, help="fill mesh holes up to N edges (0 = off)")
     s.add_argument("--refine", action="store_true", help="photo-consistency mesh refinement")
+    s.add_argument("--flythrough", default=None, choices=["orbit", "helix", "flyover", "reveal", "topdown", "capture"],
+                   help="also render a fly-through video with this pattern")
     a = ap.parse_args(argv)
     a.fn(a)
 

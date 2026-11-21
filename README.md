@@ -157,6 +157,7 @@ python -m shapekit close-holes P --max-edges 200
 python -m shapekit refine-mesh P --iterations 3
 python -m shapekit texture    P --blending multiband
 python -m shapekit chunks     P align 0 1 --by markers      :: then: chunks P merge 0 1
+python -m shapekit flythrough P --pattern orbit --seconds 20 --size 1080p   :: drone-style MP4
 python -m shapekit doctor                                    :: GPU / models / FFmpeg / GUI check
 ```
 
@@ -196,6 +197,7 @@ All of them are opt-in: with the default settings results are exactly as before.
 | Masks: import, manual, AI | `masks ai / import / clear`, Tools → Masks, photo view → *Edit mask* | Stored per photo (black = ignored). Applied to tie points, depth maps and texture. AI masks: DeepLabV3 (people, vehicles, animals). Manual: brush, free-form outline, erase, invert |
 | Camera types: frame, fisheye | `sensor --model fisheye_equidistant`, Tools → Camera Calibration | Equidistant / equisolid fisheye + Brown distortion, in alignment, both bundle adjusters, undistortion for depth/mesh/texture, COLMAP export (OPENCV_FISHEYE). Test: area_c re-rendered through a fisheye lens aligns 52/52, f recovered to 0.02% |
 | Chunks: add, duplicate, align, merge | `chunks add/duplicate/align/merge`, Workspace pane context menu, Workflow menu | Align by shared markers (coded targets) or shared photos; merge maps cameras, tie points, markers, depth maps (rescaled), point clouds and meshes into one chunk |
+| (presentation) Fly-through video | `flythrough --pattern orbit`, File → Export / Tools → Fly-through Video…, Batch Process option | Drone-style MP4 (+ poster JPG) rendered off-screen with VTK: orbit (full or partial arc), helix, flyover, reveal, top-down, or the smoothed path of your own photos. Starts on the side the site was filmed from |
 | (speed) | `align --ba-precision mixed` | GPU bundle adjustment with float32 Jacobians / Schur blocks and float64 accumulation + LM acceptance test |
 
 ## Tests and benchmarks
@@ -209,6 +211,7 @@ Run from the repo root; every `.bat` writes its log next to itself. All tests wo
 | | `feature_test.bat` | GPU rasteriser / texture visibility, SALAD retrieval |
 | | `mixed_depth_test.bat` | Depth maps with portrait + landscape neighbours |
 | | `gpu_test.bat` | One-time setup + end-to-end GPU run on one clip |
+| | `flythrough_test.bat` | Renders every fly-through pattern of gpu_test (720p, 8 s) |
 | | `test_and_build.bat` | Roadmap + GUI self-tests, then the portable build |
 | `benchmarks\` | `speed_test.bat` | Optimised vs original code paths: timing + identical outputs |
 | | `perf_test.bat` | GPU bundle adjustment + re-alignment timing |

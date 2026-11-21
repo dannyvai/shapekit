@@ -111,6 +111,7 @@ class MainWindow(QMainWindow):
         self._act(ex, "Export Tie Points…", lambda: self.export_points("sparse"))
         self._act(ex, "Export Cameras (COLMAP)…", self.export_cameras)
         self._act(ex, "Export Markers (CSV)…", self.export_markers)
+        self._act(ex, "Fly-through Video…", self.flythrough)
         self._act(m, "Generate Report", self.report)
         m.addSeparator()
         self._act(m, "Exit", self.close, "Ctrl+Q")
@@ -151,6 +152,7 @@ class MainWindow(QMainWindow):
             self._act(mm, "Import Masks…", self.masks_import),
         ]
         self._act(mm, "Clear All Masks", self.masks_clear)
+        self.workflow_actions.append(self._act(t, "Fly-through Video…", self.flythrough))
         mt = t.addMenu("Mesh")
         self.workflow_actions += [
             self._act(mt, "Refine Mesh…", self.refine_mesh),
@@ -452,7 +454,8 @@ class MainWindow(QMainWindow):
             ("depth_method", "Depth maps method", "choice", "planesweep", ["planesweep", "patchmatch"]),
             ("close_holes", "Close mesh holes up to N edges (0 = off)", "int", 0, (0, 100000)),
             ("refine", "Refine mesh (photo-consistency)", "bool", False, None),
-            ("blending", "Texture blending", "choice", "mosaic", ["mosaic", "multiband"])], self,
+            ("blending", "Texture blending", "choice", "mosaic", ["mosaic", "multiband"]),
+            ("fly", "Fly-through video", "choice", "none", ["none", "orbit", "helix", "flyover", "reveal", "topdown", "capture"])], self,
             note="Runs alignment (if needed), marker detection, depth maps, point cloud, mesh, texture, exports and report "
                  "on the active chunk.")
         if v is None:
@@ -461,7 +464,8 @@ class MainWindow(QMainWindow):
         ns = types.SimpleNamespace(project=self.project.dir, chunk=self.chunk_idx, video=None, photos=None,
                                    preset=v["preset"], shift=0.08, max_gap=1.5, workers=None, no_cloud=False,
                                    features=v["features"], no_markers=not v["markers"], depth_method=v["depth_method"],
-                                   close_holes=v["close_holes"], refine=v["refine"], blending=v["blending"])
+                                   close_holes=v["close_holes"], refine=v["refine"], blending=v["blending"],
+                                   flythrough=None if v["fly"] == "none" else v["fly"])
 
         def job():
             self.project.save()
@@ -846,6 +850,33 @@ class MainWindow(QMainWindow):
                 return
             self.run("Merge chunks", CK.merge_chunks, P, idxs, v["label"], True, v["depth"], v["cloud"], v["mesh"],
                      done=lambda _: self.set_chunk(len(P.chunks) - 1))
+
+    def flythrough(self):
+        if not self._need(None):
+            return
+        st = self.chunk.stats
+        if not (st.get("mesh") or st.get("point_cloud") or st.get("align")):
+            QMessageBox.information(self, "Fly-through", "Build a model (or at least align the photos) first."); return
+        v = ParamDialog.ask("Fly-through Video", [
+            ("pattern", "Path", "choice", "orbit", ["orbit", "helix", "flyover", "reveal", "topdown", "capture"]),
+            ("seconds", "Duration (s)", "float", 20.0, (2, 600, 1)),
+            ("size", "Resolution", "choice", "1080p", ["480p", "720p", "1080p", "1440p", "4k"]),
+            ("fps", "Frames per second", "choice", "30", ["24", "25", "30", "60"]),
+            ("elevation", "Camera elevation (deg)", "float", 30.0, (0, 89, 1)),
+            ("distance", "Distance (1 = site fills the frame)", "float", 1.0, (0.2, 5, 2)),
+            ("arc", "Orbit sweep (deg; 180 suits sites filmed from one side)", "float", 360.0, (10, 360, 0)),
+            ("display", "Show", "choice", "auto", ["auto", "textured", "colours", "shaded", "points"])], self,
+            note="orbit = circle around the site; helix = descending spiral; flyover = straight pass over it; reveal = "
+                 "start close and pull back; topdown = rotating bird's-eye view; capture = follows the path of your "
+                 "photos/video. Paths start on the side the photos were taken from. Saved as MP4 (+ JPG) in exports.")
+        if v is None:
+            return
+        out = os.path.join(self.project.dir, "exports", "flythrough_%s.mp4" % v["pattern"])
+        from ..flythrough import run_external
+        self.run("Fly-through video", run_external, self.project.dir, self.chunk_idx, out,
+                 pattern=v["pattern"], seconds=v["seconds"], size=v["size"], fps=v["fps"], elevation=v["elevation"],
+                 distance=v["distance"], arc=v["arc"], display=v["display"],
+                 done=lambda path: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
 
     # ------------------------------------------------------------------ calibration / masks / mesh tools
     def camera_calibration(self):
