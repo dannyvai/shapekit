@@ -330,30 +330,40 @@ def cmd_process(a):
     steps += (["Close Holes"] if getattr(a, "close_holes", 0) else []) + (["Refine Mesh"] if getattr(a, "refine", False) else [])
     steps += ["Build Texture", "Export + Report"] + (["Fly-through Video"] if getattr(a, "flythrough", None) else [])
 
+    from . import projlog
+    resume_from = getattr(a, "resume_from", None)     # a step name (set by --resume / the GUI's crash recovery)
+    if resume_from:
+        log("  resuming at step '%s' (earlier steps finished before the crash)" % resume_from)
+    first = steps.index(resume_from) if resume_from in steps else 0
+
     def stage(name):
-        log("========== Batch step %d/%d: %s ==========" % (steps.index(name) + 1, len(steps), name))
-    stage("Align Photos")
-    if not ch.aligned_cameras():
-        align_photos(ch, acc, kp, seq, gen, method=method, use_markers=not a.no_markers); p.save()
-    else:
-        log("  photos already aligned (%d cameras) - skipped" % len(ch.aligned_cameras()))
-    stage("Build Depth Maps")
-    build_depth_maps(ch, dq, filt, workers=a.workers, method=getattr(a, "depth_method", "planesweep")); p.save()
-    if not a.no_cloud:
-        stage("Build Point Cloud")
+        """False (skip) for steps that finished before the crash being resumed."""
+        i = steps.index(name)
+        if i < first:
+            log("========== Batch step %d/%d: %s - done before the crash, skipped ==========" % (i + 1, len(steps), name))
+            return False
+        log("========== Batch step %d/%d: %s ==========" % (i + 1, len(steps), name))
+        projlog.journal_update(stage=name)
+        return True
+    if stage("Align Photos"):
+        if not ch.aligned_cameras():
+            align_photos(ch, acc, kp, seq, gen, method=method, use_markers=not a.no_markers); p.save()
+        else:
+            log("  photos already aligned (%d cameras) - skipped" % len(ch.aligned_cameras()))
+    if stage("Build Depth Maps"):              # depth maps already computed (depth/*.npz) are reused
+        build_depth_maps(ch, dq, filt, workers=a.workers, method=getattr(a, "depth_method", "planesweep")); p.save()
+    if not a.no_cloud and stage("Build Point Cloud"):
         build_point_cloud(ch); p.save()
-    stage("Build Mesh")
-    build_mesh(ch, fc); p.save()
-    if getattr(a, "close_holes", 0):
-        stage("Close Holes")
+    if stage("Build Mesh"):
+        build_mesh(ch, fc); p.save()
+    if getattr(a, "close_holes", 0) and stage("Close Holes"):
         from .mesh import close_holes_chunk
         close_holes_chunk(ch, a.close_holes); p.save()
-    if getattr(a, "refine", False):
-        stage("Refine Mesh")
+    if getattr(a, "refine", False) and stage("Refine Mesh"):
         from .mesh import refine_mesh
         refine_mesh(ch); p.save()
-    stage("Build Texture")
-    build_texture(ch, tex, blending=getattr(a, "blending", "mosaic")); p.save()
+    if stage("Build Texture"):
+        build_texture(ch, tex, blending=getattr(a, "blending", "mosaic")); p.save()
     stage("Export + Report")
     out = os.path.join(p.dir, "exports")
     log("Exporting model (OBJ + GLB), point cloud, cameras and markers to %s..." % out)
@@ -368,7 +378,8 @@ def cmd_process(a):
     log("Generating the HTML report (renders, statistics, 3D viewer)...")
     generate_report(ch)
     if getattr(a, "flythrough", None):
-        stage("Fly-through Video")
+        projlog.journal_update(stage="Fly-through Video")
+        log("========== Batch step %d/%d: Fly-through Video ==========" % (len(steps), len(steps)))
         from .flythrough import run_external
         try:                                   # separate process: VTK off-screen rendering
             run_external(p.dir, a.chunk, os.path.join(out, "flythrough_%s.mp4" % a.flythrough), pattern=a.flythrough)
@@ -504,8 +515,43 @@ def main(argv=None):
     s.add_argument("--refine", action="store_true", help="photo-consistency mesh refinement")
     s.add_argument("--flythrough", default=None, choices=["orbit", "helix", "flyover", "reveal", "topdown", "capture"],
                    help="also render a fly-through video with this pattern")
+    s.add_argument("--resume", dest="resume_from", action="store_const", const="auto", default=None,
+                   help="continue a batch run that crashed: skip the steps it had finished")
     a = ap.parse_args(argv)
-    a.fn(a)
+    proj = getattr(a, "project", None)
+    if not proj or a.cmd == "gui" or not os.path.isdir(proj):
+        return a.fn(a)
+    from . import projlog                       # append this run to <project>/shapekit.log
+    crashed = projlog.crashed_task(proj)
+    projlog.open_log(proj, "cli " + " ".join(sys.argv[1:] if argv is None else argv))
+    if crashed:
+        msg = "the previous run crashed during '%s'%s (started %s, ran %s)" % (
+            crashed.get("title"), ", step '%s'" % crashed["stage"] if crashed.get("stage") else "",
+            crashed.get("started"), crashed.get("ran_for"))
+        projlog.write("!!!!! " + msg)
+        hint = ("  -> add --resume to continue from that step"
+                if a.cmd == "process" and not getattr(a, "resume_from", None) else "")
+        print("NOTE: %s%s" % (msg, ("\n" + hint) if hint else ""), flush=True)
+    if getattr(a, "resume_from", None) == "auto":
+        a.resume_from = (crashed or {}).get("stage")
+        if not a.resume_from:
+            print("NOTE: --resume: no crashed batch step recorded - running all steps", flush=True)
+    title = "cli " + a.cmd
+    projlog.task_start(title)
+    try:
+        r = a.fn(a)
+    except SystemExit as e:
+        projlog.task_end(title, None if e.code in (0, None) else "exit code %s" % e.code)
+        projlog.close_log()
+        raise
+    except BaseException:
+        import traceback
+        projlog.task_end(title, traceback.format_exc())
+        projlog.close_log("error")
+        raise
+    projlog.task_end(title)
+    projlog.close_log()
+    return r
 
 
 if __name__ == "__main__":

@@ -71,7 +71,35 @@ class ParamDialog(QDialog):
                 out[k] = w.text()
         return out
 
+    def set_values(self, vals):
+        for k, v in (vals or {}).items():
+            if k not in self.widgets:
+                continue
+            kind, w = self.widgets[k]
+            try:
+                if kind == "choice":
+                    w.setCurrentText(str(v))
+                elif kind == "int":
+                    w.setValue(int(v))
+                elif kind == "float":
+                    w.setValue(float(v))
+                elif kind == "bool":
+                    w.setChecked(bool(v))
+                else:
+                    w.setText(str(v))
+            except (TypeError, ValueError):
+                pass
+
+    last = None           # (title, values) of the most recently accepted dialog -> crash-recovery record
+    prefill = None        # {title: values}: open these dialogs with these values (resuming a crashed task)
+
     @staticmethod
     def ask(title, fields, parent=None, note=None):
         d = ParamDialog(title, fields, parent, note)
-        return d.values() if d.exec() == QDialog.Accepted else None
+        if ParamDialog.prefill and title in ParamDialog.prefill:
+            d.set_values(ParamDialog.prefill[title])
+            d.setWindowTitle(title + " — continue after crash")
+        if d.exec() != QDialog.Accepted:
+            return None
+        ParamDialog.last = (title, d.values())
+        return ParamDialog.last[1]

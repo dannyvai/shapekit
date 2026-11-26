@@ -269,8 +269,10 @@ def run_external(project_dir, chunk_idx, out, **opts):
     cmd += ["flythrough", project_dir, "--chunk", str(chunk_idx), "--out", out]
     for k, v in opts.items():
         cmd += ["--" + k.replace("_", "-"), str(v)]
+    from .projlog import ENV_OFF
+    env = dict(os.environ, **{ENV_OFF: "1"})     # the child's lines reach the project log through this process
     p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
-                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                         env=env, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     tail = []
     for line in p.stdout:
         line = line.rstrip()

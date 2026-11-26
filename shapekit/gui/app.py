@@ -11,7 +11,7 @@ from PySide6.QtWidgets import (QMainWindow, QApplication, QDockWidget, QTabWidge
                                QToolBar, QComboBox, QLabel, QProgressBar, QInputDialog)
 
 from ..project import Project                                          # noqa: E402
-from .. import util, edit, markers as MK                               # noqa: E402
+from .. import util, edit, markers as MK, projlog                      # noqa: E402
 from .common import LogBridge, Task, ParamDialog                       # noqa: E402
 from .model_view import ModelView, DISPLAY_MODES                       # noqa: E402
 from .photo_view import PhotoView                                      # noqa: E402
@@ -115,6 +115,8 @@ class MainWindow(QMainWindow):
         self._act(ex, "Export Markers (CSV)…", self.export_markers)
         self._act(ex, "Fly-through Video…", self.flythrough)
         self._act(m, "Generate Report", self.report)
+        self._act(m, "Show Project Log", self.show_project_log,
+                  tip="Open shapekit.log of this project: timings of every task, errors, crashes")
         m.addSeparator()
         self._act(m, "Exit", self.close, "Ctrl+Q")
 
@@ -234,10 +236,82 @@ class MainWindow(QMainWindow):
         self.chunk_idx = 0
         self.chunk = self.project.chunk(0)
         self.settings.setValue("last_project", self.project.dir)
+        crashed = projlog.crashed_task(self.project.dir)
+        projlog.open_log(self.project.dir, "gui")
+        if crashed:
+            from PySide6.QtCore import QTimer
+            QTimer.singleShot(400, lambda: self._offer_resume(crashed))
         self.setWindowTitle("shapekit — %s" % self.project.dir)
         for k in range(self.tabs.count() - 1, 0, -1):
             self.tabs.removeTab(k)
         self.refresh_all(reset_camera=True)
+
+    # ------------------------------------------------------------------ crash recovery
+    RESUME_NOTES = {
+        "depth": "Depth maps that were already finished are kept and reused.",
+        "align": "Detected features and matches are cached and reused.",
+        "process_all": "Finished batch steps are skipped.",
+        "import_video": "Videos that were fully imported are skipped.",
+    }
+
+    def _offer_resume(self, crashed):
+        import inspect
+        title, stage = crashed.get("title", "?"), crashed.get("stage")
+        rec = crashed.get("resume") or {}
+        action = rec.get("action")
+        fn = getattr(self, action, None) if action else None
+        ok = callable(fn) and all(p.default is not p.empty or p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+                                  for p in inspect.signature(fn).parameters.values())
+        where = "'%s'%s" % (title, " (batch step '%s')" % stage if stage else "")
+        projlog.write("!!!!! previous session crashed during %s - asking the user to continue" % where)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Continue after crash?")
+        box.setText("shapekit closed unexpectedly while running %s\n(started %s, ran %s)." %
+                    (where, crashed.get("started", "?"), crashed.get("ran_for", "?")))
+        if ok:
+            box.setInformativeText("Continue from where it stopped? %s\nThe settings used last time are filled in "
+                                   "(with 'reset / recompute' switched off)."
+                                   % self.RESUME_NOTES.get(action, "Results saved before the crash are kept."))
+            b_go = box.addButton("Continue", QMessageBox.AcceptRole)
+        else:
+            box.setInformativeText("Run it again from the menu to continue; results saved before the crash are kept.")
+            b_go = None
+        b_log = box.addButton("Show Log", QMessageBox.HelpRole)
+        box.addButton("Not now", QMessageBox.RejectRole)
+        box.exec()
+        b = box.clickedButton()
+        if b is b_log:
+            self.show_project_log()
+            return self._offer_resume(crashed)                 # ask again after showing the log
+        projlog.clear_crashed(self.project.dir)
+        if b is not b_go or b_go is None:
+            projlog.write("      user chose not to continue now")
+            return
+        projlog.write("      user chose to continue %s" % where)
+        if rec.get("chunk") is not None and rec["chunk"] != self.chunk_idx:
+            self.set_chunk(int(rec["chunk"]))
+        kw = {}
+        params = inspect.signature(fn).parameters
+        if "files" in params and rec.get("files"):
+            kw["files"] = rec["files"]
+        if "resume_from" in params and stage:
+            kw["resume_from"] = stage
+        params_v = dict(rec.get("params") or {})
+        for key in ("reset", "reset_features", "force"):      # never throw away the work done before the crash
+            if key in params_v:
+                params_v[key] = False
+        ParamDialog.prefill = {rec["dialog"]: params_v} if rec.get("dialog") else None
+        try:
+            fn(**kw)
+        finally:
+            ParamDialog.prefill = None
+
+    def show_project_log(self):
+        p = projlog.path()
+        if not p or not os.path.exists(p):
+            QMessageBox.information(self, "Project log", "Open a project first."); return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(p))
 
     def save(self):
         if self.project:
@@ -287,9 +361,15 @@ class MainWindow(QMainWindow):
             self.status("Add marker: click on the model surface")
 
     # ------------------------------------------------------------------ background tasks
-    def run(self, title, fn, *a, done=None, reload=False, **k):
+    def run(self, title, fn, *a, done=None, reload=False, resume=None, **k):
         if self.task is not None:
             QMessageBox.information(self, "Busy", "Another task is running."); return
+        # crash recovery: which menu handler started this task, and the dialog values it was given
+        rec = dict(action=sys._getframe(1).f_code.co_name, chunk=self.chunk_idx)
+        if ParamDialog.last:
+            rec["dialog"], rec["params"] = ParamDialog.last
+            ParamDialog.last = None
+        rec.update(resume or {})
         if self.project:
             self.project.save()
         for act in self.workflow_actions:
@@ -297,11 +377,14 @@ class MainWindow(QMainWindow):
         self.busy.show(); self.status(title + "…"); self._task_title = title
         self.console_dock.raise_()
         self.task = Task(fn, *a, **k)
+        projlog.task_start(title, rec)
 
         def finished(res, err):
+            projlog.task_end(title, err)
             self.task = None
             self._task_title = None
             self.busy.hide()
+            QApplication.restoreOverrideCursor()
             for act in self.workflow_actions:
                 act.setEnabled(True)
             if err:
@@ -321,6 +404,8 @@ class MainWindow(QMainWindow):
             if done and not err:
                 done(res)
         self.task.finished_with.connect(finished)
+        # arrow + spinning circle while a task runs (the window stays usable: views, console, menus)
+        QApplication.setOverrideCursor(Qt.BusyCursor)
         self.task.start()
 
     def _status_from_log(self, line):
@@ -341,10 +426,11 @@ class MainWindow(QMainWindow):
         return True
 
     # ------------------------------------------------------------------ workflow
-    def import_video(self):
+    def import_video(self, checked=False, files=None):
         if not self._need(None) or not self._ensure_ffmpeg():
             return
-        files, _ = QFileDialog.getOpenFileNames(self, "Import video", "", "Video (*.mp4 *.mov *.m4v *.avi *.mkv *.mts)")
+        if not files:
+            files, _ = QFileDialog.getOpenFileNames(self, "Import video", "", "Video (*.mp4 *.mov *.m4v *.avi *.mkv *.mts)")
         if not files:
             return
         v = ParamDialog.ask("Import Video", [
@@ -362,10 +448,11 @@ class MainWindow(QMainWindow):
         from ..video import import_video
 
         def job():
-            for f in files:
+            for i, f in enumerate(files):
                 import_video(self.chunk, f, v["shift"], v["gap"], min_sharpness=v["sharp"])
                 self.project.save()
-        self.run("Import video", job)
+                projlog.journal_update(files=files[i + 1:])         # what is left if the app dies now
+        self.run("Import video", job, resume=dict(files=list(files)))
 
     def add_photos(self):
         if not self._need(None):
@@ -465,7 +552,7 @@ class MainWindow(QMainWindow):
             self.run("Build texture", build_texture, self.chunk, int(v["size"]), blending=v["blending"],
                      done=lambda _: self.set_display("Mesh (textured)"))
 
-    def process_all(self):
+    def process_all(self, checked=False, resume_from=None):
         if not self._need(None):
             return
         v = ParamDialog.ask("Batch Process", [
@@ -487,7 +574,7 @@ class MainWindow(QMainWindow):
                                    min_sharpness=float(self.settings.value("video_min_sharpness", 0.7)), workers=None, no_cloud=False,
                                    features=v["features"], no_markers=not v["markers"], depth_method=v["depth_method"],
                                    close_holes=v["close_holes"], refine=v["refine"], blending=v["blending"],
-                                   flythrough=None if v["fly"] == "none" else v["fly"])
+                                   flythrough=None if v["fly"] == "none" else v["fly"], resume_from=resume_from)
 
         def job():
             self.project.save()
@@ -1073,6 +1160,7 @@ class MainWindow(QMainWindow):
             pass
         self.save()
         self.model.close()
+        projlog.close_log("clean exit" if self.task is None else "quit while a task was running")
         super().closeEvent(ev)
 
 
@@ -1091,9 +1179,11 @@ def _crash_reporting():
         return None
     f.write("\n=== shapekit started %s ===\n" % _t.strftime("%Y-%m-%d %H:%M:%S"))
     faulthandler.enable(file=f, all_threads=True)
+    projlog.set_crash_file(f)
 
     def hook(et, ev, tb):
         f.write("Uncaught exception:\n" + "".join(traceback.format_exception(et, ev, tb)))
+        projlog.write("UNCAUGHT EXCEPTION (GUI thread):\n" + "".join(traceback.format_exception(et, ev, tb)))
         sys.__excepthook__(et, ev, tb)
     sys.excepthook = hook
     return f.name
