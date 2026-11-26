@@ -18,19 +18,7 @@ from .util import log
 IMG_EXT = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")
 
 
-def ffmpeg_bin(name="ffmpeg"):
-    # portable build: ffmpeg.exe / ffprobe.exe shipped next to ShapeKit.exe (or in its ffmpeg\ folder)
-    import sys
-    if getattr(sys, "frozen", False):
-        base = os.path.dirname(sys.executable)
-        for d in (base, os.path.join(base, "ffmpeg")):
-            for n in (name + ".exe", name):
-                if os.path.isfile(os.path.join(d, n)):
-                    return os.path.join(d, n)
-    exe = shutil.which(name)
-    if exe is None:
-        raise RuntimeError("%s not found on PATH. Install FFmpeg (https://ffmpeg.org) to import videos." % name)
-    return exe
+from .ffmpeg import ffmpeg_bin  # noqa: E402,F401  (re-exported: flythrough / doctor import it from here)
 
 
 def probe(path):

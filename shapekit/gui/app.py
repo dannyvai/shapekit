@@ -166,6 +166,9 @@ class MainWindow(QMainWindow):
         self._act(t, "Select Small Mesh Components…", self.select_components)
         t.addSeparator()
         self._act(t, "Reset Region", self.reset_region)
+        t.addSeparator()
+        self._act(t, "FFmpeg Location…", self.ffmpeg_settings,
+                  tip="Choose which ffmpeg.exe / ffprobe.exe is used for video import and fly-through videos")
 
         v = mb.addMenu("&View")
         self.display_group = QActionGroup(self)
@@ -339,7 +342,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ workflow
     def import_video(self):
-        if not self._need(None):
+        if not self._need(None) or not self._ensure_ffmpeg():
             return
         files, _ = QFileDialog.getOpenFileNames(self, "Import video", "", "Video (*.mp4 *.mov *.m4v *.avi *.mkv *.mts)")
         if not files:
@@ -879,6 +882,8 @@ class MainWindow(QMainWindow):
         st = self.chunk.stats
         if not (st.get("mesh") or st.get("point_cloud") or st.get("align")):
             QMessageBox.information(self, "Fly-through", "Build a model (or at least align the photos) first."); return
+        if not self._ensure_ffmpeg():
+            return
         v = ParamDialog.ask("Fly-through Video", [
             ("pattern", "Path", "choice", "orbit", ["orbit", "helix", "flyover", "reveal", "topdown", "capture"]),
             ("seconds", "Duration (s)", "float", 20.0, (2, 600, 1)),
@@ -899,6 +904,74 @@ class MainWindow(QMainWindow):
                  pattern=v["pattern"], seconds=v["seconds"], size=v["size"], fps=v["fps"], elevation=v["elevation"],
                  distance=v["distance"], arc=v["arc"], display=v["display"],
                  done=lambda path: QDesktopServices.openUrl(QUrl.fromLocalFile(path)))
+
+    # ------------------------------------------------------------------ FFmpeg
+    def _ensure_ffmpeg(self):
+        """True if ffmpeg + ffprobe are found; otherwise offer to locate / download them."""
+        from .. import ffmpeg as FF
+        if FF.find("ffmpeg") and FF.find("ffprobe"):
+            return True
+        self.ffmpeg_settings(missing=True)
+        return bool(FF.find("ffmpeg") and FF.find("ffprobe"))
+
+    def ffmpeg_settings(self, checked=False, missing=False):
+        from .. import ffmpeg as FF
+        while True:
+            FF.reset_cache()
+            box = QMessageBox(self)
+            box.setWindowTitle("FFmpeg Location")
+            box.setIcon(QMessageBox.Warning if missing else QMessageBox.Information)
+            head = ("FFmpeg is needed to import videos and render fly-throughs, and it was not found.\n\n"
+                    if missing else "")
+            box.setText(head + FF.describe())
+            box.setInformativeText("Browse: pick ffmpeg.exe (ffprobe.exe must be in the same folder).\n"
+                                   "Download: fetch a copy into the app's ffmpeg folder (about 100 MB).\n"
+                                   "Automatic: forget the chosen location and search bundled copy / PATH / "
+                                   "winget, Chocolatey, Scoop installs.")
+            b_browse = box.addButton("Browse…", QMessageBox.ActionRole)
+            b_dl = box.addButton("Download", QMessageBox.ActionRole) if sys.platform == "win32" else None
+            b_auto = box.addButton("Automatic", QMessageBox.ResetRole)
+            box.addButton(QMessageBox.Close)
+            box.exec()
+            b = box.clickedButton()
+            if b is b_browse:
+                start = os.path.dirname(FF.find("ffmpeg") or "") or os.environ.get("ProgramFiles", "")
+                f, _ = QFileDialog.getOpenFileName(self, "Select ffmpeg.exe", start,
+                                                   "ffmpeg (ffmpeg.exe ffmpeg);;Programs (*.exe);;All files (*)")
+                if f:
+                    try:
+                        ff, fp = FF.set_location(f)
+                        self.status("FFmpeg: %s" % ff)
+                        missing = not (ff and fp)
+                    except Exception as e:
+                        QMessageBox.warning(self, "FFmpeg Location", str(e))
+                continue
+            if b is b_auto:
+                FF.set_location(None)
+                missing = not (FF.find("ffmpeg") and FF.find("ffprobe"))
+                continue
+            if b_dl is not None and b is b_dl:
+                self._download_ffmpeg()
+            return
+
+    def _download_ffmpeg(self):
+        from .. import ffmpeg as FF
+        dest = FF.bundled_dir()
+        try:
+            os.makedirs(dest, exist_ok=True)
+            probe = os.path.join(dest, ".write_test"); open(probe, "w").close(); os.remove(probe)
+        except OSError:                                   # e.g. app folder under Program Files
+            dest = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "shapekit", "ffmpeg")
+
+        def job():
+            from ..tools.get_ffmpeg import main as get
+            if get(dest) != 0:
+                raise RuntimeError("FFmpeg download failed - see the Console, or use Browse to pick an installed ffmpeg.exe")
+            if os.path.normcase(dest) != os.path.normcase(FF.bundled_dir()):
+                FF.set_location(dest)
+            FF.reset_cache()
+            return FF.find("ffmpeg")
+        self.run("Download FFmpeg", job, done=lambda p: p and self.status("FFmpeg: %s" % p))
 
     # ------------------------------------------------------------------ calibration / masks / mesh tools
     def camera_calibration(self):

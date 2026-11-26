@@ -52,7 +52,9 @@ Regenerate this gallery for any finished project with `docs\make_media.bat` (edi
 
 ## Install (Windows, uv)
 
-1. Install FFmpeg with `winget install Gyan.FFmpeg`, then open a new terminal.
+1. FFmpeg: either `winget install Gyan.FFmpeg`, or `uv run python -m shapekit get-ffmpeg` (downloads it into
+   `ffmpeg\` here). shapekit also finds winget/Chocolatey/Scoop installs that are not on PATH yet. To use a
+   specific copy: **Tools ▸ FFmpeg Location…** in the app, or `python -m shapekit config ffmpeg C:\path\to\ffmpeg\bin`.
 2. In this folder, run:
 
 ```bat
@@ -271,7 +273,7 @@ into `models\`, builds with PyInstaller and produces **`dist\ShapeKit\`**:
 - `ShapeKit.exe` – the desktop app (no console window). `ShapeKit.exe <project folder>` opens a project.
 - `shapekit-cli.exe` – the command line (`shapekit-cli.exe process ...`, `shapekit-cli.exe doctor`).
 - `models\` – ALIKED/SuperPoint/DISK, LightGlue, DINOv2 + SALAD, DeepLabV3 weights (works offline).
-- `ffmpeg\` – FFmpeg for video import (copied from your PATH).
+- `ffmpeg\` – FFmpeg for video import (the copy shapekit finds on the build PC; downloaded automatically if there is none).
 
 Copy the whole `ShapeKit` folder anywhere (another PC, a USB disk); nothing needs installing. It includes the CUDA
 12.8 runtime: on another PC only an NVIDIA driver (570+) is needed; without an NVIDIA GPU it runs on the CPU.

@@ -11,6 +11,7 @@ wheels/
 build/
 dist/
 models/
+ffmpeg/
 
 # Input footage and processed projects (large, local data)
 videos/

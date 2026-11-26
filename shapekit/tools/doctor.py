@@ -116,10 +116,9 @@ def main(project=None):
     item("Plane-sweep depth + rasteriser", depth_gpu)
 
     def ff():
-        from ..video import ffmpeg_bin
-        import subprocess
-        out = subprocess.run([ffmpeg_bin(), "-version"], capture_output=True, text=True).stdout.splitlines()[0]
-        return out[:60]
+        from ..ffmpeg import ffmpeg_bin, version
+        ff = ffmpeg_bin(); ffmpeg_bin("ffprobe")
+        return "%s  [%s]" % (version(ff)[:48], ff)
     item("FFmpeg", ff)
 
     def pm():

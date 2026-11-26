@@ -375,6 +375,17 @@ def cmd_process(a):
     log("All done in %.1f min -> %s" % ((time.time() - t_all) / 60, out))
 
 
+def cmd_config(a):
+    from . import config, ffmpeg
+    if a.key == "ffmpeg" and (a.value or a.clear):
+        try:
+            ffmpeg.set_location(None if a.clear else a.value)
+        except ValueError as e:
+            sys.exit("error: %s" % e)
+    print("settings file:", config.path())
+    print(ffmpeg.describe())
+
+
 def main(argv=None):
     import faulthandler
     faulthandler.enable()                       # native crashes print a stack instead of closing silently
@@ -467,6 +478,13 @@ def main(argv=None):
     s = sub.add_parser("doctor", help="check GPU, models, FFmpeg and the GUI"); s.add_argument("project", nargs="?")
     s.set_defaults(fn=lambda a: sys.exit(__import__("shapekit.tools.doctor", fromlist=["main"]).main(a.project)))
     sp("info", cmd_info)
+    s = sub.add_parser("config", help="show or change settings, e.g.  config ffmpeg C:\\ffmpeg\\bin  /  config ffmpeg --clear")
+    s.add_argument("key", nargs="?", choices=["ffmpeg"]); s.add_argument("value", nargs="?")
+    s.add_argument("--clear", action="store_true", help="remove the saved value")
+    s.set_defaults(fn=cmd_config)
+    s = sub.add_parser("get-ffmpeg", help="download FFmpeg (Windows) into the app's ffmpeg folder")
+    s.add_argument("dest", nargs="?"); s.add_argument("--url", default=None)
+    s.set_defaults(fn=lambda a: sys.exit(__import__("shapekit.tools.get_ffmpeg", fromlist=["main"]).main(a.dest, a.url)))
     s = sp("process", cmd_process)
     s.add_argument("--video", nargs="*"); s.add_argument("--photos", nargs="*")
     s.add_argument("--preset", default="balanced", choices=list(PRESETS))
