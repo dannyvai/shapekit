@@ -349,16 +349,21 @@ class MainWindow(QMainWindow):
             return
         v = ParamDialog.ask("Import Video", [
             ("shift", "Keyframe every … of image motion", "float", 0.08, (0.02, 0.5, 3)),
-            ("gap", "Max seconds between keyframes", "float", 1.5, (0.2, 10, 1))], self,
+            ("gap", "Max seconds between keyframes", "float", 1.5, (0.2, 10, 1)),
+            ("sharp", "Skip blurry frames below (sharpness vs. nearby frames, 0 = off)", "float",
+             float(self.settings.value("video_min_sharpness", 0.7)), (0.0, 1.0, 2))], self,
             note="Frames are picked automatically: a new keyframe whenever the view moved by the given fraction of "
-                 "the image width; within each window the sharpest frame wins.")
+                 "the image width; within each window the sharpest frame wins. If that frame is still motion-blurred "
+                 "the window is stretched a little to find a sharper one, and blurry keyframes are dropped where "
+                 "their neighbours overlap enough without them.")
         if v is None:
             return
+        self.settings.setValue("video_min_sharpness", v["sharp"])
         from ..video import import_video
 
         def job():
             for f in files:
-                import_video(self.chunk, f, v["shift"], v["gap"])
+                import_video(self.chunk, f, v["shift"], v["gap"], min_sharpness=v["sharp"])
                 self.project.save()
         self.run("Import video", job)
 
@@ -478,7 +483,8 @@ class MainWindow(QMainWindow):
             return
         from ..cli import cmd_process
         ns = types.SimpleNamespace(project=self.project.dir, chunk=self.chunk_idx, video=None, photos=None,
-                                   preset=v["preset"], shift=0.08, max_gap=1.5, workers=None, no_cloud=False,
+                                   preset=v["preset"], shift=0.08, max_gap=1.5,
+                                   min_sharpness=float(self.settings.value("video_min_sharpness", 0.7)), workers=None, no_cloud=False,
                                    features=v["features"], no_markers=not v["markers"], depth_method=v["depth_method"],
                                    close_holes=v["close_holes"], refine=v["refine"], blending=v["blending"],
                                    flythrough=None if v["fly"] == "none" else v["fly"])

@@ -84,7 +84,7 @@ _cache = {}
 
 def find(name="ffmpeg"):
     """Full path of ffmpeg / ffprobe, or None."""
-    if name in _cache and os.path.isfile(_cache[name]):
+    if isinstance(_cache.get(name), str) and os.path.isfile(_cache[name]):
         return _cache[name]
     hit = None
     first = find("ffmpeg") if name != "ffmpeg" else None
@@ -123,6 +123,22 @@ def version(exe):
     if out.returncode != 0 or not out.stdout:
         raise RuntimeError("%s does not run (exit %d)" % (exe, out.returncode))
     return out.stdout.splitlines()[0]
+
+
+def passthrough(exe=None):
+    """Output-timing option that keeps every decoded frame as is (no duplicates / drops).
+    FFmpeg >= 5.1 has `-fps_mode passthrough`; `-vsync` was deprecated then and removed in FFmpeg 8."""
+    exe = exe or ffmpeg_bin()
+    key = ("fps_mode", exe)
+    if key not in _cache:
+        try:
+            r = subprocess.run([exe, "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=16x16:d=0.1",
+                                "-fps_mode", "passthrough", "-f", "null", "-"], capture_output=True, timeout=20,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            _cache[key] = r.returncode == 0
+        except Exception:
+            _cache[key] = True
+    return ["-fps_mode", "passthrough"] if _cache[key] else ["-vsync", "0"]
 
 
 def set_location(p):

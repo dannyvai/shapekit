@@ -18,14 +18,18 @@ from .util import log
 IMG_EXT = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")
 
 
-from .ffmpeg import ffmpeg_bin  # noqa: E402,F401  (re-exported: flythrough / doctor import it from here)
+from .ffmpeg import ffmpeg_bin, passthrough  # noqa: E402,F401  (re-exported: flythrough / doctor import it from here)
 
 
 def probe(path):
     out = subprocess.run([ffmpeg_bin("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
                           "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration:stream_side_data=rotation:stream_tags=rotate",
-                          "-of", "json", path], capture_output=True, text=True, check=True).stdout
-    s = json.loads(out)["streams"][0]
+                          "-of", "json", path], capture_output=True, text=True,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if out.returncode != 0 or not json.loads(out.stdout or "{}").get("streams"):
+        raise RuntimeError("ffprobe cannot read a video stream in %s: %s"
+                           % (path, (out.stderr or "no video stream").strip()[-300:]))
+    s = json.loads(out.stdout)["streams"][0]
     w, h = int(s["width"]), int(s["height"])
     rot = 0
     for sd in s.get("side_data_list", []) or []:
@@ -45,22 +49,50 @@ def sharpness(gray):
     return float(cv2.Laplacian(gray, cv2.CV_32F, ksize=3).var())
 
 
-def select_keyframes(path, overlap_shift=0.08, max_gap_s=1.5, analysis_width=640, max_fps=30.0, progress=True):
-    """Return list of (frame_index, sharpness) for selected keyframes."""
+def select_keyframes(path, overlap_shift=0.08, max_gap_s=1.5, analysis_width=640, max_fps=30.0, progress=True,
+                     min_sharpness=0.7, sharp_width=1280):
+    """Return ([(frame_index, sharpness), ...], info) for the selected keyframes.
+
+    Motion: optical flow on a `analysis_width` copy; a keyframe is due once the view moved by `overlap_shift` of
+    the image width (or after `max_gap_s` seconds / when tracking is lost).
+    Blur: Laplacian variance on a larger `sharp_width` copy (fine motion blur disappears when downscaled to 640),
+    compared with the sharpest frames nearby (last ~2 s while scanning, +-1 s for the final check) ("relative sharpness": 1 = as sharp as the best nearby
+    frames). Content changes slowly, so this separates blur from "less texture in view".
+    Selection, per window:
+      - candidates are all frames between 0.35x and 1x the target motion; the sharpest one wins;
+      - if even that one is below `min_sharpness` (relative), the window is extended up to 1.6x the target
+        motion to look for a sharper frame (overlap stays high: 1.6 x the default 8 % shift is 13 % of the width);
+      - afterwards, keyframes still below `min_sharpness` are dropped where their neighbours are close enough
+        that no gap appears (<= 1.8x target motion and <= max gap apart).
+    min_sharpness=0 restores plain "sharpest frame per window" behaviour."""
+    from collections import deque
     info = probe(path)
-    aw = analysis_width
+    sw = min(int(sharp_width), info["width"]) // 2 * 2
+    sh = int(round(info["height"] * sw / info["width"] / 2)) * 2
+    aw = min(analysis_width, sw)
     ah = int(round(info["height"] * aw / info["width"] / 2)) * 2
     step = max(1, int(round(info["fps"] / max_fps)))
-    cmd = [ffmpeg_bin(), "-v", "error", "-i", path, "-vf", "scale=%d:%d,format=gray" % (aw, ah),
-           "-vsync", "0", "-f", "rawvideo", "-pix_fmt", "gray", "-"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=aw * ah * 8)
-    fsize = aw * ah
+    import tempfile
+    cmd = [ffmpeg_bin(), "-v", "error", "-i", path, "-vf", "scale=%d:%d,format=gray" % (sw, sh),
+           *passthrough(), "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    fsize = sw * sh
+    errf = tempfile.TemporaryFile()                     # ffmpeg's messages (a file: a full pipe could block ffmpeg)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errf, bufsize=fsize * 4,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     lk = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
-    selected, window = [], []
-    prev, p0, ref_pts, n = None, None, None, -1
     thresh = overlap_shift * aw
+    lo, hi = 0.35, 1.6                                  # candidate window / extension limit (x target motion)
     max_gap = int(max_gap_s * info["fps"])
-    last_key = -10 ** 9
+    recent = deque(maxlen=max(8, int(2.0 * info["fps"] / step)))      # sharpness of the last ~2 s
+    selected, window = [], []                           # items: [frame, sharpness, relative, travel]
+    prev, p0, ref_pts, n = None, None, None, -1
+    last_key, travel_base, first, extended = -10 ** 9, 0.0, True, 0
+    all_s = []                                          # (frame, sharpness) of every analysed frame
+
+    def reset_tracks(g):
+        q = cv2.goodFeaturesToTrack(g, 500, 0.01, 8)
+        return q, (q.copy() if q is not None else None)
+
     while True:
         buf = proc.stdout.read(fsize)
         if len(buf) < fsize:
@@ -68,13 +100,17 @@ def select_keyframes(path, overlap_shift=0.08, max_gap_s=1.5, analysis_width=640
         n += 1
         if n % step:
             continue
-        g = np.frombuffer(buf, np.uint8).reshape(ah, aw)
-        s = sharpness(g)
+        full = np.frombuffer(buf, np.uint8).reshape(sh, sw)
+        s = sharpness(full)
+        g = full if aw == sw else cv2.resize(full, (aw, ah), interpolation=cv2.INTER_AREA)
+        recent.append(s); all_s.append((n, s))
+        ref = max(float(np.percentile(recent, 90)), 1e-6)
+        rel = s / ref
         if prev is None:
-            selected.append((n, s)); last_key = n
-            p0 = cv2.goodFeaturesToTrack(g, 500, 0.01, 8)
-            ref_pts = p0.copy() if p0 is not None else None
+            window.append([n, s, rel, 0.0])
+            p0, ref_pts = reset_tracks(g)
             prev = g
+            last_key = n
             continue
         motion, frac = thresh * 10, 0.0
         if p0 is not None and len(p0) >= 8:
@@ -84,27 +120,76 @@ def select_keyframes(path, overlap_shift=0.08, max_gap_s=1.5, analysis_width=640
             if ok.sum() >= 8:
                 motion = float(np.median(np.linalg.norm((p1 - ref_pts)[ok].reshape(-1, 2), axis=1)))
                 p0, ref_pts = p1[ok].reshape(-1, 1, 2), ref_pts[ok].reshape(-1, 1, 2)
-        if motion > 0.6 * thresh or n - last_key > 0.6 * max_gap:
-            window.append((n, s))
-        if motion >= thresh or frac < 0.35 or n - last_key >= max_gap:
-            if window:
-                best = max(window, key=lambda x: x[1])
-                selected.append(best); last_key = best[0]
-            window = []
-            p0 = cv2.goodFeaturesToTrack(g, 500, 0.01, 8)
-            ref_pts = p0.copy() if p0 is not None else None
+        lost = frac < 0.35 or n - last_key >= max_gap
+        if first:
+            # first keyframe: sharpest frame before the view has moved 40 % of the target
+            window.append([n, s, rel, travel_base + min(motion, thresh)])
+            close = lost or motion >= 0.4 * thresh
+        else:
+            if motion > lo * thresh or n - last_key > 0.6 * max_gap:
+                window.append([n, s, rel, travel_base + min(motion, hi * thresh)])
+            best = max(window, key=lambda x: x[1]) if window else None
+            good = best is not None and best[2] >= min_sharpness
+            # due (>= 1x target) and the best candidate is sharp enough -> take it; if it is blurry keep
+            # looking up to `hi` x target; tracking lost / max gap -> take the best we have
+            close = lost or motion >= hi * thresh or (motion >= thresh and good)
+            if motion >= thresh and not close:
+                extended += 1
+        if close:
+            moved = min(motion, hi * thresh) if motion < thresh * 10 else thresh    # thresh*10 = flow failed
+            best = max(window, key=lambda x: x[1]) if window else [n, s, rel, travel_base + moved]
+            selected.append(best)
+            last_key = best[0]
+            travel_base += moved
+            window, first = [], False
+            p0, ref_pts = reset_tracks(g)
         prev = g
         if progress and n % (step * 300) == 0:
             log("  analysed %d/%d frames, %d keyframes" % (n, info["frames"], len(selected)))
-    proc.stdout.close(); proc.wait()
+    proc.stdout.close(); rc = proc.wait()
+    errf.seek(0); err = errf.read().decode("utf-8", "replace").strip(); errf.close()
+    if n < 0:
+        raise RuntimeError("ffmpeg could not decode %s (exit %d): %s" % (path, rc, err or "no frames"))
+    if rc != 0 or err:
+        log("  ffmpeg %s: %s" % ("error (exit %d)" % rc if rc else "warnings", err[-500:]))
     if window:
         selected.append(max(window, key=lambda x: x[1]))
     # de-duplicate, sort
-    seen, out = set(), []
-    for f, s in sorted(selected):
-        if f not in seen:
-            seen.add(f); out.append((f, s))
-    return out, info
+    seen, keys = set(), []
+    for k in sorted(selected, key=lambda x: x[0]):
+        if k[0] not in seen:
+            seen.add(k[0]); keys.append(k)
+    # final relative sharpness against the sharpest frames within +-1 s (before AND after the frame)
+    if all_s:
+        fr = np.array([x[0] for x in all_s]); sv = np.array([x[1] for x in all_s])
+        half = max(1, int(info["fps"]))
+        for k in keys:
+            m = np.abs(fr - k[0]) <= half
+            k[2] = k[1] / max(float(np.percentile(sv[m], 90)), 1e-6)
+    # drop keyframes that are still blurry where the neighbours overlap enough without them
+    dropped = 0
+    if min_sharpness > 0:
+        i = 1
+        while i < len(keys) - 1:
+            a, k, b = keys[i - 1], keys[i], keys[i + 1]
+            if k[2] < min_sharpness and b[3] - a[3] <= 1.8 * thresh and b[0] - a[0] <= max_gap:
+                del keys[i]; dropped += 1
+            else:
+                i += 1
+    rels = np.array([k[2] for k in keys]) if keys else np.zeros(1)
+    log("  blur filter: windows extended %d frames, %d blurry keyframes dropped, %d kept below %.2f relative sharpness (median %.2f)"
+        % (extended, dropped, int((rels < min_sharpness).sum()), min_sharpness, float(np.median(rels))))
+    return [(k[0], k[1]) for k in keys], info
+
+
+def select_expr(frames):
+    """`select` filter expression matching the given frame numbers, as a balanced tree of sums:
+    (eq(n,a)+eq(n,b))+(eq(n,c)+eq(n,d)).  FFmpeg 8 limits expressions to 100 nesting levels (a flat
+    a+b+c+... chain of 150 terms fails with 'Cannot allocate memory'); the tree needs only ~log2(N)."""
+    if len(frames) == 1:
+        return "eq(n\\,%d)" % frames[0]
+    h = len(frames) // 2
+    return "(%s)+(%s)" % (select_expr(frames[:h]), select_expr(frames[h:]))
 
 
 def extract_frames(path, frames, out_dir, prefix, quality=2):
@@ -115,10 +200,12 @@ def extract_frames(path, frames, out_dir, prefix, quality=2):
     names = []
     for b in range(0, len(frames), 150):
         batch = frames[b:b + 150]
-        expr = "+".join("eq(n\\,%d)" % f for f in batch)
+        expr = select_expr(batch)
         cmd = [ffmpeg_bin(), "-v", "error", "-y", "-i", path, "-vf", "select='%s'" % expr,
-               "-vsync", "0", "-q:v", str(quality), os.path.join(tmp, "x_%06d.jpg")]
-        subprocess.run(cmd, check=True)
+               *passthrough(), "-q:v", str(quality), os.path.join(tmp, "x_%06d.jpg")]
+        r = subprocess.run(cmd, capture_output=True, text=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            raise RuntimeError("ffmpeg frame extraction failed (exit %d): %s" % (r.returncode, r.stderr.strip()[-500:]))
         outs = sorted(glob.glob(os.path.join(tmp, "x_*.jpg")))
         if len(outs) != len(batch):
             log("  warning: expected %d frames, got %d" % (len(batch), len(outs)))
@@ -140,11 +227,12 @@ def get_sensor(chunk, w, h, label):
     return len(chunk.sensors) - 1
 
 
-def import_video(chunk, path, overlap_shift=0.08, max_gap_s=1.5, shared_sensor=True):
-    """Import keyframes from a video into the chunk. All frames of one device/resolution share a sensor."""
+def import_video(chunk, path, overlap_shift=0.08, max_gap_s=1.5, shared_sensor=True, min_sharpness=0.7):
+    """Import keyframes from a video into the chunk. All frames of one device/resolution share a sensor.
+    min_sharpness: skip motion-blurred frames (0..1, relative to the sharpest nearby frames; 0 = off)."""
     stem = os.path.splitext(os.path.basename(path))[0]
     log("Import video %s" % path)
-    keys, info = select_keyframes(path, overlap_shift, max_gap_s)
+    keys, info = select_keyframes(path, overlap_shift, max_gap_s, min_sharpness=min_sharpness)
     log("  %d keyframes selected from %d frames (%.0f fps)" % (len(keys), info["frames"], info["fps"]))
     sharp = dict(keys)
     names = extract_frames(path, [k for k, _ in keys], os.path.join(chunk.dir, "images"), stem)

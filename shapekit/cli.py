@@ -80,7 +80,8 @@ def cmd_add_video(a):
     ch = p.chunk(a.chunk)
     for v in expand_videos(a.videos):
         t = time.time()
-        n = import_video(ch, v, overlap_shift=a.shift, max_gap_s=a.max_gap)
+        n = import_video(ch, v, overlap_shift=a.shift, max_gap_s=a.max_gap,
+                             min_sharpness=getattr(a, "min_sharpness", 0.7))
         ch.add_log("Import Video", time.time() - t, video=os.path.basename(v), frames=n)
         p.save()
 
@@ -305,7 +306,8 @@ def cmd_process(a):
         from .video import import_video
         for v in expand_videos(a.video):
             t = time.time()
-            n = import_video(ch, v, overlap_shift=a.shift, max_gap_s=a.max_gap)
+            n = import_video(ch, v, overlap_shift=a.shift, max_gap_s=a.max_gap,
+                             min_sharpness=getattr(a, "min_sharpness", 0.7))
             ch.add_log("Import Video", time.time() - t, video=os.path.basename(v), frames=n)
             p.save()
     if a.photos and not any(c.source is None for c in ch.cameras):
@@ -403,6 +405,8 @@ def main(argv=None):
     s = sp("add-video", cmd_add_video); s.add_argument("videos", nargs="+")
     s.add_argument("--shift", type=float, default=0.08, help="image shift (fraction of width) between keyframes")
     s.add_argument("--max-gap", type=float, default=1.5, help="max seconds between keyframes")
+    s.add_argument("--min-sharpness", type=float, default=0.7,
+                   help="skip motion-blurred frames: minimum sharpness relative to nearby frames (0-1, 0 = off)")
     s = sp("add-photos", cmd_add_photos); s.add_argument("paths", nargs="+")
     s = sp("quality", cmd_quality); s.add_argument("--disable-below", type=float, default=0.5)
     s = sp("align", cmd_align)
@@ -489,6 +493,8 @@ def main(argv=None):
     s.add_argument("--video", nargs="*"); s.add_argument("--photos", nargs="*")
     s.add_argument("--preset", default="balanced", choices=list(PRESETS))
     s.add_argument("--shift", type=float, default=0.08); s.add_argument("--max-gap", type=float, default=1.5)
+    s.add_argument("--min-sharpness", type=float, default=0.7,
+                   help="skip motion-blurred frames: minimum sharpness relative to nearby frames (0-1, 0 = off)")
     s.add_argument("--workers", type=int, default=None); s.add_argument("--no-cloud", action="store_true")
     s.add_argument("--features", default="auto", choices=["auto", "sift", "superpoint", "aliked", "disk"])
     s.add_argument("--no-markers", action="store_true", help="skip coded-target detection")
