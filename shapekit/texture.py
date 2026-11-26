@@ -59,6 +59,10 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
         vgpu = VisibilityGPU(V, F, cen, fn, farea)
         dev = "GPU (resident mesh)"
     log("Build Texture: %d faces, %d cameras (visibility on %s)" % (nf, len(cams), dev))
+    from .underwater import Corrector
+    uw = Corrector(chunk)                       # underwater colour (Tools > Underwater Colour...), off by default
+    if uw.active:
+        log("  underwater colour: %s" % uw.describe())
     from . import masks as MS
     mcams = set(MS.masked_cameras(chunk))
 
@@ -170,7 +174,32 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
             img = read_image(chunk.abspath(chunk.cameras[i]), scale=vis_scale)
             c = img[pv[sel].astype(int).clip(0, img.shape[0] - 1), pu[sel].astype(int).clip(0, img.shape[1] - 1), ::-1]
             return np.clip(np.median(ref[vis[sel]] / (c + 1.0), axis=0), 0.6, 1.6)
-        if fast_mode():
+        if uw.active:
+            # the vertex colours still carry the water: compare the photos' CORRECTED colours with each other
+            # (reference = mean corrected colour of each face over all photos that sampled it)
+            def samp(k):
+                i = cams[k]
+                vis, pu, pv = vis_rgb[k]
+                sel = np.where(label[vis] == k)[0]
+                if len(sel) < 200:
+                    sel = np.arange(len(vis))
+                if len(sel) < 50:
+                    return None
+                sel = sel[:: max(1, len(sel) // 5000)]
+                img = read_image(chunk.abspath(chunk.cameras[i]), scale=vis_scale)
+                c = img[pv[sel].astype(int).clip(0, img.shape[0] - 1), pu[sel].astype(int).clip(0, img.shape[1] - 1), ::-1]
+                z = np.linalg.norm(cen[vis[sel]] - chunk.cameras[i].center, axis=1)
+                return vis[sel], uw.correct_samples(c, z).astype(np.float64)
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(n_workers(8)) as ex:
+                smp = list(ex.map(samp, range(len(cams))))
+            rsum = np.zeros((nf, 3)); rcnt = np.zeros(nf)
+            for r in smp:
+                if r is not None:
+                    np.add.at(rsum, r[0], r[1]); np.add.at(rcnt, r[0], 1)
+            uref = rsum / np.maximum(rcnt, 1)[:, None] + 1
+            res = [None if r is None else np.clip(np.median(uref[r[0]] / (r[1] + 1.0), axis=0), 0.6, 1.6) for r in smp]
+        elif fast_mode():
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(n_workers(8)) as ex:
                 res = list(ex.map(gain, range(len(cams))))
@@ -226,8 +255,9 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
         cam = chunk.cameras[i]
         sen = chunk.sensors[cam.sensor]
         img = read_image(chunk.abspath(cam))
-        m1, m2, _ = cm.undistort_maps(sen.calib(), sen.width, sen.height, 1.0)
+        m1, m2, Kf = cm.undistort_maps(sen.calib(), sen.width, sen.height, 1.0)
         und = cv2.remap(img, m1, m2, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+        und = uw.apply(i, und, Kf)
         if color_correction:
             und = np.clip(und.astype(np.float32) * gains[k][::-1][None, None], 0, 255).astype(np.uint8)
         for c in cs:
@@ -258,7 +288,7 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
     uv_px[fl] = (corner_uv_px[fl] - boxes[c_of, None, :2]) * s + np.array(pos)[c_of][:, None, :]
     if blending == "multiband":
         log("  multiband blending: sampling every photo to level seams and exposure steps...")
-        _seam_leveling(chunk, V, F, cams, label, S, vis_rgb, gains, vis_scale, atlas, uv_px, fl)
+        _seam_leveling(chunk, V, F, cams, label, S, vis_rgb, gains, vis_scale, atlas, uv_px, fl, uw=uw)
     uv_px[~fl] = [2, 2]
     atlas[0:5, 0:5] = 127
     UV = uv_px.reshape(-1, 2) / size
@@ -271,7 +301,8 @@ def build_texture(chunk, size=8192, vis_scale=0.5, color_correction=True, smooth
     write_obj(out, V, F, UV, face_uv, texture_file=tex)
     np.savez_compressed(chunk.path("model", "uv.npz"), uv=UV.astype(np.float32), face_uv=face_uv)
     chunk.stats["texture"] = dict(size=size, charts=int(nchart), scale=float(s), blending=blending,
-                                  textured_faces_pct=float(100 * fl.mean()))
+                                  textured_faces_pct=float(100 * fl.mean()),
+                                  underwater=uw.s["mode"] if uw.active else "off")
     chunk.add_log("Build Texture", time.time() - t0, size=size, charts=int(nchart))
     log("Texture written: %s" % out)
     return out
@@ -308,7 +339,7 @@ def _bilinear(img, x, y):
             (img[y0 + 1, x0] * (1 - fx) + img[y0 + 1, x0 + 1] * fx) * fy)
 
 
-def _seam_leveling(chunk, V, F, cams, label, S, vis_rgb, gains, vis_scale, atlas, uv_px, fl, sigma=2.0):
+def _seam_leveling(chunk, V, F, cams, label, S, vis_rgb, gains, vis_scale, atlas, uv_px, fl, sigma=2.0, uw=None):
     """Two-band blending in the atlas. Low band: every vertex gets the score-weighted mean of its (low-pass,
     gain-corrected) colour over all photos that see it; each face corner's own-photo colour is pulled to that
     mean by a smooth correction field interpolated across the face and added to the mosaic (high band kept
@@ -329,6 +360,8 @@ def _seam_leveling(chunk, V, F, cams, label, S, vis_rgb, gains, vis_scale, atlas
         img = read_image(chunk.abspath(cam))
         m1, m2, Ks = cm.undistort_maps(sen.calib(), sen.width, sen.height, vis_scale)
         und = cv2.remap(img, m1, m2, cv2.INTER_AREA)
+        if uw is not None:
+            und = uw.apply(i, und, Ks)
         und = cv2.GaussianBlur(und.astype(np.float32), (0, 0), sigma)
         fv = Fi[vis]
         vids = np.unique(fv)

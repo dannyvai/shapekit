@@ -167,6 +167,9 @@ class MainWindow(QMainWindow):
         self._act(t, "Filter Point Cloud by Confidence…", self.filter_confidence)
         self._act(t, "Select Small Mesh Components…", self.select_components)
         t.addSeparator()
+        self._act(t, "Underwater Colour…", self.underwater_colour,
+                  tip="White balance from a reference patch, or remove the water's colour cast per pixel (for the texture)")
+        t.addSeparator()
         self._act(t, "Reset Region", self.reset_region)
         t.addSeparator()
         self._act(t, "FFmpeg Location…", self.ffmpeg_settings,
@@ -245,6 +248,15 @@ class MainWindow(QMainWindow):
         for k in range(self.tabs.count() - 1, 0, -1):
             self.tabs.removeTab(k)
         self.refresh_all(reset_camera=True)
+
+    def underwater_colour(self):
+        if not self._need("aligned"):
+            return
+        from .underwater_dialog import UnderwaterDialog
+        if getattr(self, "_uw_dialog", None) is not None and self._uw_dialog.chunk is self.chunk:
+            self._uw_dialog.show(); self._uw_dialog.raise_(); return
+        self._uw_dialog = UnderwaterDialog(self)
+        self._uw_dialog.show()
 
     # ------------------------------------------------------------------ crash recovery
     RESUME_NOTES = {

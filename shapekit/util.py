@@ -6,12 +6,66 @@ import cv2
 _T0 = time.time()
 
 
+# ---- Unicode safety (Windows) ------------------------------------------------------------------------------
+# 1) The console / redirected log uses the ANSI code page (cp1252): printing a Hebrew/Cyrillic/... path raised
+#    UnicodeEncodeError. Write UTF-8 instead; characters a real console cannot show become '?'.
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+
+# 2) OpenCV's imread/imwrite cannot open non-ASCII paths on Windows (they return None / False). Route such
+#    paths through Python file I/O + imdecode/imencode. Installed once for every module that uses cv2.
+def _install_unicode_imageio():
+    if getattr(cv2, "_shapekit_unicode", False):
+        return
+    _imread, _imwrite = cv2.imread, cv2.imwrite
+
+    def imread(path, flags=cv2.IMREAD_COLOR):
+        p = str(path)
+        if p.isascii():
+            return _imread(p, flags)
+        try:
+            data = np.fromfile(p, np.uint8)
+        except OSError:
+            return None
+        return cv2.imdecode(data, flags) if data.size else None
+
+    def imwrite(path, img, params=None):
+        p = str(path)
+        if p.isascii():
+            return _imwrite(p, img, params) if params is not None else _imwrite(p, img)
+        ext = os.path.splitext(p)[1] or ".png"
+        ok, buf = cv2.imencode(ext, img, params if params is not None else [])
+        if not ok:
+            return False
+        try:
+            buf.tofile(p)
+        except OSError:
+            return False
+        return True
+    cv2.imread, cv2.imwrite = imread, imwrite
+    cv2._shapekit_unicode = True
+
+
+import os                                                         # noqa: E402
+_install_unicode_imageio()
+
+
 LOG_HOOKS = []      # GUI console subscribes here
 
 
 def log(msg):
     line = "[%7.1fs] %s" % (time.time() - _T0, msg)
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except (UnicodeEncodeError, ValueError, OSError):           # odd stream encoding / closed console
+        try:
+            print(line.encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
     for h in list(LOG_HOOKS):
         try:
             h(line)

@@ -399,6 +399,44 @@ def cmd_config(a):
     print(ffmpeg.describe())
 
 
+def cmd_underwater(a):
+    from . import underwater as UW
+    p = Project.open(a.project); ch = p.chunk(a.chunk)
+    s = UW.load_settings(ch)
+    if a.mode:
+        s["mode"] = a.mode
+    if a.patch:
+        lab, *xy = a.patch
+        idx = next((k for k, c in enumerate(ch.cameras) if c.label == lab or os.path.basename(c.path) == lab), None)
+        if idx is None:
+            sys.exit("error: no photo called %s" % lab)
+        s["patch"] = dict(camera=idx, label=ch.cameras[idx].label,
+                          rect=UW.photo_rect_to_undistorted(ch, idx, [float(v) for v in xy]))
+    if a.no_patch:
+        s["patch"] = None
+    if a.true_color:
+        s["ref_rgb"] = [int(v) for v in a.true_color.split(",")]
+    if a.neutral:
+        s["ref_rgb"] = None
+    if a.strength is not None:
+        s["strength"] = a.strength
+    s["params"] = None
+    if s["mode"] != "off":
+        s["params"] = UW.estimate(ch, s)
+    UW.save_settings(ch, s)
+    log("underwater colour: %s -> %s (rebuild the texture to apply)" % (UW.MODE_LABELS[s["mode"]], UW.settings_path(ch)))
+    if a.preview:
+        import cv2
+        import numpy as np
+        lab, out = a.preview
+        idx = next((k for k, c in enumerate(ch.cameras) if c.label == lab or os.path.basename(c.path) == lab), None)
+        if idx is None:
+            sys.exit("error: no photo called %s" % lab)
+        bef, aft = UW.preview(ch, idx, s, scale=0.5)
+        cv2.imwrite(out, np.hstack([bef, aft]))
+        log("preview (before | after): %s" % out)
+
+
 def main(argv=None):
     import faulthandler
     faulthandler.enable()                       # native crashes print a stack instead of closing silently
@@ -493,6 +531,16 @@ def main(argv=None):
     s = sub.add_parser("doctor", help="check GPU, models, FFmpeg and the GUI"); s.add_argument("project", nargs="?")
     s.set_defaults(fn=lambda a: sys.exit(__import__("shapekit.tools.doctor", fromlist=["main"]).main(a.project)))
     sp("info", cmd_info)
+    s = sp("underwater", cmd_underwater, help="underwater colour correction for the texture (then rebuild the texture)")
+    s.add_argument("--mode", choices=["off", "wb", "seathru"], help="wb = white balance from a patch; seathru = "
+                   "distance-aware water removal (needs a mesh)")
+    s.add_argument("--patch", nargs=5, metavar=("PHOTO", "X0", "Y0", "X1", "Y1"),
+                   help="reference patch: photo label/file name and a pixel rectangle in that photo")
+    s.add_argument("--no-patch", action="store_true", help="forget the patch (grey-world white point)")
+    s.add_argument("--true-color", metavar="R,G,B", help="the patch's real colour in air (default: neutral grey)")
+    s.add_argument("--neutral", action="store_true", help="the patch is neutral grey / white")
+    s.add_argument("--strength", type=float, default=None, help="distance-aware strength (0-1.5, default 1)")
+    s.add_argument("--preview", nargs=2, metavar=("PHOTO", "OUT.jpg"), help="write a before|after preview of one photo")
     s = sub.add_parser("config", help="show or change settings, e.g.  config ffmpeg C:\\ffmpeg\\bin  /  config ffmpeg --clear")
     s.add_argument("key", nargs="?", choices=["ffmpeg"]); s.add_argument("value", nargs="?")
     s.add_argument("--clear", action="store_true", help="remove the saved value")
