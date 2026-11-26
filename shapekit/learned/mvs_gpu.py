@@ -10,10 +10,15 @@ def gpu_available():
         return False
 
 
-def compute_depth_gpu(ref, nbrs, zmin, zmax, n_planes=128, win=7, best_k=2, mem_budget=3e8):
+def compute_depth_gpu(ref, nbrs, zmin, zmax, n_planes=128, win=7, best_k=2, mem_budget=3e8, device="cuda"):
+    """Memory: the cost of each depth plane is reduced to a running best (value, plane index, and the costs of
+    the planes on either side for the sub-plane fit) as soon as it is computed, instead of keeping the whole
+    (planes x H x W) cost volume: ~7 values per pixel instead of 3 x n_planes (256 planes of a 27 MP photo
+    needed ~42 GB, more than any GPU, and Windows then silently pages GPU memory to system RAM - 100 % GPU,
+    no progress). Results are identical (costs are still rounded to float16 per plane, ties keep the first plane)."""
     import torch
     import torch.nn.functional as F
-    dev = torch.device("cuda")
+    dev = torch.device(device)
     h, w = ref.h, ref.w
     pad = win // 2
 
@@ -43,9 +48,13 @@ def compute_depth_gpu(ref, nbrs, zmin, zmax, n_planes=128, win=7, best_k=2, mem_
         t_rel = nb.t - R_rel @ ref.t
         rel.append((nb.K, R_rel, t_rel))
     n = np.array([0, 0, 1.0])
-    cost = torch.empty((n_planes, h, w), dtype=torch.float16, device=dev)
+    best_c = torch.full((h, w), float("inf"), dtype=torch.float32, device=dev)   # running minimum cost
+    best_i = torch.zeros((h, w), dtype=torch.int32, device=dev)                  # ... and its plane
+    c_lo = torch.zeros((h, w), dtype=torch.float32, device=dev)                  # cost of plane best-1
+    c_hi = torch.zeros((h, w), dtype=torch.float32, device=dev)                  # cost of plane best+1
+    c_prev = None
     from ..util import fast_mode
-    if fast_mode():
+    if fast_mode() and dev.type == "cuda":
         # planes are independent -> batch as many as fit in ~40% of free GPU memory (identical results,
         # far fewer kernel launches than the fixed 300 MB budget)
         free, _ = torch.cuda.mem_get_info()
@@ -79,15 +88,24 @@ def compute_depth_gpu(ref, nbrs, zmin, zmax, n_planes=128, win=7, best_k=2, mem_
             del q, z, u, v, valid, grid, src, S, mu_n, var_n, cov, cg
         if Nn > best_k:
             c = torch.topk(c, best_k, dim=1, largest=False).values
-        cost[b0:b0 + len(ds)] = c.mean(1).half()
+        cm_ = c.mean(1).half().float()                                     # same float16 rounding as before
         del c
-    costf = cost.float()
-    best = torch.argmin(costf, 0)
-    cmin = torch.gather(costf, 0, best[None])[0]
+        for j in range(cm_.shape[0]):
+            k = b0 + j
+            ck = cm_[j]
+            if c_prev is not None:
+                c_hi = torch.where(best_i == k - 1, ck, c_hi)                 # neighbour above the current best
+            better = ck < best_c                                           # strict: ties keep the first plane
+            best_c = torch.where(better, ck, best_c)
+            best_i = torch.where(better, torch.full_like(best_i, k), best_i)
+            c_lo = torch.where(better, c_prev if c_prev is not None else ck, c_lo)
+            c_prev = ck
+        del cm_
+    best = best_i.long()
+    cmin = best_c
     b0_ = best.clamp(1, n_planes - 2)
-    c0 = torch.gather(costf, 0, (b0_ - 1)[None])[0]
-    c1 = torch.gather(costf, 0, b0_[None])[0]
-    c2 = torch.gather(costf, 0, (b0_ + 1)[None])[0]
+    # at edge planes (0, n-1) the fit is irrelevant: those pixels are masked out below
+    c0, c1, c2 = c_lo, best_c, c_hi
     denom = c0 - 2 * c1 + c2
     off = torch.where(denom > 1e-6, 0.5 * (c0 - c2) / denom.clamp_min(1e-6), torch.zeros_like(denom)).clamp(-0.5, 0.5)
     invt = torch.from_numpy(inv).float().to(dev)
@@ -99,5 +117,5 @@ def compute_depth_gpu(ref, nbrs, zmin, zmax, n_planes=128, win=7, best_k=2, mem_
     mask = (cmin < 0.6) & ~edge & tex & validref
     depth = torch.where(mask, depth, torch.zeros_like(depth))
     out = depth.cpu().numpy().astype(np.float32), (1 - cmin).cpu().numpy().astype(np.float32)
-    del cost, costf
+    del best_c, best_i, c_lo, c_hi, c_prev
     return out

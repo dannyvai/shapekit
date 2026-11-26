@@ -335,6 +335,18 @@ def cmd_process(a):
     if resume_from:
         log("  resuming at step '%s' (earlier steps finished before the crash)" % resume_from)
     first = steps.index(resume_from) if resume_from in steps else 0
+    # never skip a step whose results are not actually there (e.g. a project file overwritten after the crash)
+    have = {"Align Photos": bool(ch.aligned_cameras()),
+            "Build Depth Maps": any(os.path.exists(os.path.join(ch.dir, "depth", "%05d.npz" % i))
+                                    for i in ch.aligned_cameras()),
+            "Build Point Cloud": a.no_cloud or bool(ch.stats.get("point_cloud")),
+            "Build Mesh": os.path.exists(os.path.join(ch.dir, "mesh.ply")) and bool(ch.stats.get("mesh")),
+            "Build Texture": bool(ch.stats.get("texture"))}
+    for k, name in enumerate(steps[:first]):
+        if name in have and not have[name]:
+            log("  '%s' has no results in the project - resuming from there instead of '%s'" % (name, resume_from))
+            first = k
+            break
 
     def stage(name):
         """False (skip) for steps that finished before the crash being resumed."""

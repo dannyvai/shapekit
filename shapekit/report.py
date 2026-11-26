@@ -103,11 +103,14 @@ def comparison_figs(chunk, n=3, scale=0.4):
     out = []
     for i in [al[int(k)] for k in np.linspace(0, len(al) - 1, n + 2)[1:-1]]:
         cam = chunk.cameras[i]; sen = chunk.sensors[cam.sensor]
-        K = cm.K_matrix(sen.intr, scale)
-        w, h = int(sen.width * scale), int(sen.height * scale)
-        r, _ = raster.render_textured(V, F, d["uv"], d["face_uv"], atlas, cam.rvec, cam.tvec, K, w, h, bg=(44, 36, 32))
-        m1, m2, _ = cm.undistort_maps(sen.calib(), sen.width, sen.height, scale)
+        # render at exactly the undistorted photo's size and intrinsics (int() vs round() differed by a pixel
+        # for e.g. 4872 x 0.4 = 1948.8, and the side-by-side failed)
+        m1, m2, K = cm.undistort_maps(sen.calib(), sen.width, sen.height, scale)
         ref = cv2.remap(read_image(chunk.abspath(cam)), m1, m2, cv2.INTER_AREA)
+        h, w = ref.shape[:2]
+        r, _ = raster.render_textured(V, F, d["uv"], d["face_uv"], atlas, cam.rvec, cam.tvec, K, w, h, bg=(44, 36, 32))
+        if r.shape[:2] != ref.shape[:2]:
+            r = cv2.resize(r, (w, h), interpolation=cv2.INTER_AREA)
         out.append((cam.label, np.hstack([ref, r])))
     return out
 

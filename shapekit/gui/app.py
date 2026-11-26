@@ -327,8 +327,12 @@ class MainWindow(QMainWindow):
 
     def save(self):
         if self.project:
+            if getattr(self, "_disk_owned", False) and self.task is not None:
+                self.status("Not saved: a running task (%s) is writing the project" % (self._task_title or "task"))
+                return False
             self.project.save()
             self.status("Saved")
+        return True
 
     def refresh_all(self, reset_camera=False, reload_project=False):
         if reload_project and self.project:
@@ -389,10 +393,14 @@ class MainWindow(QMainWindow):
         self.busy.show(); self.status(title + "…"); self._task_title = title
         self.console_dock.raise_()
         self.task = Task(fn, *a, **k)
+        # reload=True: the task works on its own copy of the project (e.g. Batch Process) and saves it itself;
+        # the window's copy is stale until the task ends and must not be written over the task's results
+        self._disk_owned = bool(reload)
         projlog.task_start(title, rec)
 
         def finished(res, err):
             projlog.task_end(title, err)
+            self._disk_owned = False
             self.task = None
             self._task_title = None
             self.busy.hide()
@@ -1170,7 +1178,8 @@ class MainWindow(QMainWindow):
             util.LOG_HOOKS.remove(self.bridge.line.emit)
         except ValueError:
             pass
-        self.save()
+        if self.save() is False:          # the task's own saves are what's on disk: leave them alone
+            projlog.write("      window's project copy not saved on quit: the running task owns project.json")
         self.model.close()
         projlog.close_log("clean exit" if self.task is None else "quit while a task was running")
         super().closeEvent(ev)

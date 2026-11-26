@@ -151,6 +151,21 @@ def compute_depth(ref, nbrs, zmin, zmax, n_planes=128, win=7, best_k=2):
     return depth.astype(np.float32), (1 - cmin).astype(np.float32)
 
 
+class _Progress:
+    """'depth map 12/269 (GPAC0167): 61% valid, 24s/map, ~1h 47m left' - shows a slow step is still moving."""
+
+    def __init__(self, n):
+        self.n, self.t0, self.last = n, time.time(), time.time()
+
+    def line(self, k):
+        now = time.time()
+        each, self.last = now - self.last, now
+        avg = (now - self.t0) / (k + 1)
+        left = avg * (self.n - k - 1)
+        eta = "%dh %02dm" % (left // 3600, left % 3600 // 60) if left >= 3600 else "%dm %02ds" % (left // 60, left % 60)
+        return ", %.0fs/map, ~%s left" % (each, eta)
+
+
 def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbors=5, n_planes=None, force=False,
                      workers=None, gpu=None, method="planesweep"):
     """method: 'planesweep' (fronto-parallel sweep, default) or 'patchmatch' (slanted planes with normals)."""
@@ -159,6 +174,8 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
     scale = QUALITY[quality]
     nbmap = select_neighbors(chunk, n_neighbors)
     aligned = chunk.aligned_cameras()
+    if not aligned:
+        raise RuntimeError("Build Depth Maps: no aligned cameras - run Align Photos first")
     n_planes = n_planes or {1.0: 256, 0.5: 192, 0.25: 128, 0.125: 96, 0.0625: 64}[scale]
     win = 9 if scale >= 0.5 else 7
     views = {}
@@ -174,12 +191,26 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
         log("Build Depth Maps: %d cameras, quality=%s (scale %.3g), PatchMatch with normals" % (len(aligned), quality, scale))
     else:
         log("Build Depth Maps: %d cameras, quality=%s (scale %.3g), %d planes" % (len(aligned), quality, scale, n_planes))
-    jobs = []
+    jobs, stale = [], 0
     for i in aligned:
         p = chunk.path("depth", "%05d.npz" % i)
-        if (os.path.exists(p) and not force) or not nbmap.get(i):
+        if not nbmap.get(i):
             continue
+        if os.path.exists(p) and not force:
+            if depth_is_current(p, chunk.cameras[i], scale):
+                continue
+            stale += 1
+            os.remove(p)                                   # made for another alignment / quality: recompute
+            fp = p[:-4] + "_f.npz"
+            if os.path.exists(fp):
+                os.remove(fp)
         jobs.append((chunk.project.dir, chunk.project.chunks.index(chunk), i, nbmap[i], scale, n_planes, win, method))
+    prog = _Progress(len(jobs))
+    reused = 0 if force else sum(os.path.exists(chunk.path("depth", "%05d.npz" % i)) for i in aligned)
+    if reused:
+        log("  %d depth maps already computed are reused" % reused)
+    if stale:
+        log("  %d old depth maps were made for a different alignment or quality - recomputing them" % stale)
     from .learned.mvs_gpu import gpu_available
     use_gpu = gpu_available() and gpu is not False
     workers = workers or max(1, min((os.cpu_count() or 2) - 1, 8))
@@ -208,8 +239,8 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
                 if rng is not None:
                     d, conf = _compute(meth, ref, [vfut(j).result() for j in nb], rng[0], rng[1], npl, wn, gpu=True)
                     writes.append(writer.submit(save_depth, chunk.path("depth", "%05d.npz" % i), d, conf, ref.K, sc))
-                    log("  depth map %d/%d (%s): %.0f%% valid" % (k + 1, len(jobs), chunk.cameras[i].label,
-                                                                 100 * (d > 0).mean()))
+                    log("  depth map %d/%d (%s): %.0f%% valid%s" % (k + 1, len(jobs), chunk.cameras[i].label,
+                                                                   100 * (d > 0).mean(), prog.line(k)))
                 # release views no longer needed by upcoming jobs
                 keep = set()
                 for (_, _, i2, nb2, _, _, _, _) in jobs[k + 1:k + lookahead + 2]:
@@ -226,16 +257,17 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
                 if rng is None:
                     continue
                 d, conf = _compute(meth, ref, [view(j) for j in nb], rng[0], rng[1], npl, wn, gpu=True)
-                save_depth(chunk.path("depth", "%05d.npz" % i), d, conf, ref.K, sc)
-                log("  depth map %d/%d (%s): %.0f%% valid" % (k + 1, len(jobs), chunk.cameras[i].label, 100 * (d > 0).mean()))
+                save_depth(chunk.path("depth", "%05d.npz" % i), d, conf, ref.K, sc, chunk.cameras[i])
+                log("  depth map %d/%d (%s): %.0f%% valid%s" % (k + 1, len(jobs), chunk.cameras[i].label,
+                                                               100 * (d > 0).mean(), prog.line(k)))
     elif workers > 1 and len(jobs) > 2 and method != "patchmatch":
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(workers) as ex:
             for k, msg in enumerate(ex.map(_depth_job, jobs)):
-                log("  depth map %d/%d %s" % (k + 1, len(jobs), msg))
+                log("  depth map %d/%d %s%s" % (k + 1, len(jobs), msg, prog.line(k)))
     else:
         for k, jb in enumerate(jobs):
-            log("  depth map %d/%d %s" % (k + 1, len(jobs), _depth_job(jb, view)))
+            log("  depth map %d/%d %s%s" % (k + 1, len(jobs), _depth_job(jb, view), prog.line(k)))
     chunk.stats["depth_maps"] = dict(quality=quality, filter=filter_mode, cameras=len(aligned), method=method)
     from .util import fast_mode
     have_f = all(os.path.exists(chunk.path("depth", "%05d_f.npz" % i)) for i in aligned
@@ -263,7 +295,7 @@ def _depth_job(args, view_fn=None):
         return "%d: no depth range" % i
     nbrs = [view_fn(j) for j in nb]
     d, conf = _compute(meth, ref, nbrs, rng[0], rng[1], n_planes, win, gpu=False)
-    save_depth(ch.path("depth", "%05d.npz" % i), d, conf, ref.K, scale)
+    save_depth(ch.path("depth", "%05d.npz" % i), d, conf, ref.K, scale, ch.cameras[i])
     return "(%s): %.0f%% valid" % (ch.cameras[i].label, 100 * (d > 0).mean())
 
 
@@ -277,9 +309,27 @@ def _compute(method, ref, nbrs, zmin, zmax, n_planes, win, gpu):
     return compute_depth(ref, nbrs, zmin, zmax, n_planes, win)
 
 
-def save_depth(path, d, conf, K, scale):
+def _pose(cam):
+    return np.concatenate([np.asarray(cam.rvec, float).ravel(), np.asarray(cam.tvec, float).ravel()])
+
+
+def depth_is_current(path, cam, scale):
+    """A saved depth map can be reused only if it was made for this camera pose and resolution. Maps from
+    before an Align Photos rerun describe other poses / another scale and would corrupt the model."""
+    try:
+        with np.load(path) as z:
+            if "pose" not in z.files or abs(float(z["scale"]) - float(scale)) > 1e-9:
+                return False
+            return bool(np.allclose(z["pose"], _pose(cam), rtol=0, atol=1e-6))
+    except Exception:
+        return False
+
+
+def save_depth(path, d, conf, K, scale, cam=None):
     from .util import fast_mode
     arrs = dict(depth=d.astype(np.float16), conf=(conf * 255).clip(0, 255).astype(np.uint8), K=K, scale=scale)
+    if cam is not None:
+        arrs["pose"] = _pose(cam)
     # uncompressed in fast mode: zlib on every map cost more CPU than the GPU sweep itself
     (np.savez if fast_mode() else np.savez_compressed)(path, **arrs)
     fp = path[:-4] + "_f.npz"
@@ -445,6 +495,8 @@ def build_point_cloud(chunk, point_spacing=None, stride=1, min_conf=0):
         if o is None:
             continue
         P.append(o[0]); Cc.append(o[1]); N.append(o[2]); Q.append(o[3]); scale = o[4]
+    if not P:
+        raise RuntimeError("Build Point Cloud: no depth maps to use - run Align Photos and Build Depth Maps first")
     P, Cc, N, Q = np.concatenate(P), np.concatenate(Cc), np.concatenate(N), np.concatenate(Q)
     P, Cc, N, Q = crop_to_region(chunk, P, Cc, N, Q)
     if point_spacing is None:
