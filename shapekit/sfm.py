@@ -78,8 +78,8 @@ class Reconstruction:
         for m in getattr(self.chunk, "markers", None) or []:
             if not m.get("enabled", True):
                 continue
-            pr = [(int(k), v["xy"]) for k, v in m["projections"].items()
-                  if not v.get("disabled") and self.chunk.cameras[int(k)].enabled]
+            pr = [(int(k), v["xy"]) for k, v in m["projections"].items()   # outliers (misreads) stay out
+                  if not v.get("disabled") and not v.get("outlier") and self.chunk.cameras[int(k)].enabled]
             if len(pr) < 2:
                 continue
             tid = self.T + len(self.marker_trk)
@@ -669,6 +669,12 @@ def align_photos(chunk, accuracy="high", max_features=10000, sequential_window=1
     rec.clear_checkpoint()
     region_from_sparse(chunk)
     chunk.transform = None                       # new internal frame: the old transform is meaningless
+    if use_markers:
+        from . import markers as MK
+        try:                                     # which detections are the same physical target: by 3D position
+            MK.regroup_auto_markers(chunk)
+        except Exception as e:
+            log("  coded target regrouping skipped: %s" % e)
     if use_markers and chunk.markers:
         from . import markers as MK
         try:
@@ -676,6 +682,9 @@ def align_photos(chunk, accuracy="high", max_features=10000, sequential_window=1
             MK.refine_marker_projections(chunk)  # guided placement in photos where the code was unreadable
         except Exception as e:
             log("  guided marker placement skipped: %s" % e)
+        MK.drop_inconsistent_auto(chunk)
+        if any(m.get("auto") for m in chunk.markers):
+            final_target_adjustment(chunk, ba_precision=ba_precision)
         if any(m.get("reference") for m in chunk.markers) or chunk.scalebars:
             try:
                 MK.update_transform(chunk)
@@ -752,6 +761,25 @@ def optimize_cameras(chunk, fit=("f", "cx", "cy", "k1", "k2", "k3", "p1", "p2"),
             pass
     chunk.add_log("Optimize Cameras", 0, gcp=bool(use_gcp), **st)
     return st
+
+
+def final_target_adjustment(chunk, ba_precision=None):
+    """Cameras, tie points and the cleaned coded targets adjusted together (targets weigh 4x a tie point),
+    so the camera poses agree with every confirmed target observation; then the targets are re-placed in
+    all photos from their refined 3D positions and re-checked."""
+    from . import markers as MK
+    n = sum(1 for m in chunk.markers if m.get("position") is not None)
+    log("  final adjustment: cameras + tie points + %d coded targets together..." % n)
+    try:
+        st = optimize_cameras(chunk, gcp=True, ba_precision=ba_precision)
+        MK.refine_marker_projections(chunk)
+        MK.drop_inconsistent_auto(chunk)
+        errs = [m["error_px"] for m in chunk.markers if m.get("error_px") is not None]
+        log("  final adjustment done: tie point RMS %s, targets %d, median target error %.2f px"
+            % (("%.2f px" % st["rms_reprojection_px"]) if isinstance(st, dict) and "rms_reprojection_px" in st else "n/a",
+               len(chunk.markers), float(np.median(errs)) if errs else float("nan")))
+    except Exception as e:
+        log("  final adjustment skipped: %s" % e)
 
 
 def region_from_sparse(chunk, lo=2, hi=98, pad=0.1):

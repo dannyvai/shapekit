@@ -152,17 +152,39 @@ def compute_depth(ref, nbrs, zmin, zmax, n_planes=128, win=7, best_k=2):
 
 
 class _Progress:
-    """'depth map 12/269 (GPAC0167): 61% valid, 24s/map, ~1h 47m left' - shows a slow step is still moving."""
+    """'depth map 12/697 (GPAC0167): 61% valid, 8s/map, ~15m 40s left'.
+    Photos of different sensors / resolutions take very different times (4K video frames ~1 s, 27 MP stills
+    ~9 s), so the estimate is kept per sensor: the recent time per map of each sensor x its maps still to do;
+    a sensor not reached yet is estimated from the measured time per pixel of the others."""
 
-    def __init__(self, n):
-        self.n, self.t0, self.last = n, time.time(), time.time()
+    def __init__(self, keys, pixels):
+        from collections import defaultdict, deque
+        self.keys, self.pixels = list(keys), dict(pixels)          # job -> sensor key; key -> pixels per map
+        self.n, self.t0, self.last = len(self.keys), time.time(), time.time()
+        self.times = defaultdict(lambda: deque(maxlen=12))         # recent seconds per map, per sensor
+
+    def _rate(self, key):
+        if self.times[key]:
+            return float(np.median(self.times[key]))
+        per_px = [float(np.median(v)) / max(self.pixels.get(k, 1), 1) for k, v in self.times.items() if v]
+        return (float(np.median(per_px)) * self.pixels.get(key, 1)) if per_px else None
 
     def line(self, k):
         now = time.time()
         each, self.last = now - self.last, now
-        avg = (now - self.t0) / (k + 1)
-        left = avg * (self.n - k - 1)
-        eta = "%dh %02dm" % (left // 3600, left % 3600 // 60) if left >= 3600 else "%dm %02ds" % (left // 60, left % 60)
+        if k < self.n:
+            self.times[self.keys[k]].append(each)
+        todo = {}
+        for key in self.keys[k + 1:]:
+            todo[key] = todo.get(key, 0) + 1
+        left = 0.0
+        for key, cnt in todo.items():
+            r = self._rate(key)
+            if r is None:
+                return ", %.0fs/map" % each
+            left += r * cnt
+        eta = ("%dh %02dm" % (left // 3600, left % 3600 // 60) if left >= 3600 else
+               "%dm %02ds" % (left // 60, left % 60))
         return ", %.0fs/map, ~%s left" % (each, eta)
 
 
@@ -205,7 +227,8 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
             if os.path.exists(fp):
                 os.remove(fp)
         jobs.append((chunk.project.dir, chunk.project.chunks.index(chunk), i, nbmap[i], scale, n_planes, win, method))
-    prog = _Progress(len(jobs))
+    keys = [chunk.cameras[jb[2]].sensor for jb in jobs]
+    prog = _Progress(keys, {k: chunk.sensors[k].width * chunk.sensors[k].height * scale * scale for k in set(keys)})
     reused = 0 if force else sum(os.path.exists(chunk.path("depth", "%05d.npz" % i)) for i in aligned)
     if reused:
         log("  %d depth maps already computed are reused" % reused)
@@ -238,7 +261,8 @@ def build_depth_maps(chunk, quality="medium", filter_mode="moderate", n_neighbor
                 rng = depth_range(chunk, i, ref)
                 if rng is not None:
                     d, conf = _compute(meth, ref, [vfut(j).result() for j in nb], rng[0], rng[1], npl, wn, gpu=True)
-                    writes.append(writer.submit(save_depth, chunk.path("depth", "%05d.npz" % i), d, conf, ref.K, sc))
+                    writes.append(writer.submit(save_depth, chunk.path("depth", "%05d.npz" % i), d, conf, ref.K, sc,
+                                                chunk.cameras[i]))
                     log("  depth map %d/%d (%s): %.0f%% valid%s" % (k + 1, len(jobs), chunk.cameras[i].label,
                                                                    100 * (d > 0).mean(), prog.line(k)))
                 # release views no longer needed by upcoming jobs

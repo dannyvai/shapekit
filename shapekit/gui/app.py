@@ -722,10 +722,16 @@ class MainWindow(QMainWindow):
             v = ParamDialog.ask("Detect Markers", [
                 ("bits", "Target type", "choice", "12", ["12", "14", "16", "20"]),
                 ("min_radius", "Minimum centre-dot radius (px)", "float", 2.0, (1, 50, 1)),
-                ("tolerance", "Decoding tolerance (higher = stricter)", "float", 0.3, (0.05, 0.9, 2)),
-                ("guided", "Guided placement in all photos", "bool", True, None)], self,
-                note="Circular coded targets (centre dot + coded ring). IDs seen in fewer than 2 photos or "
-                     "inconsistent across photos are rejected.")
+                ("tolerance", "Minimum code confidence (0.3 recommended)", "float", 0.3, (0.05, 0.9, 2)),
+                ("guided", "Guided placement in all photos", "bool", True, None),
+                ("adjust", "Then adjust cameras to agree with the targets", "bool",
+                 not ch.stats.get("depth_maps"), None)], self,
+                note="Circular coded targets (centre dot + coded ring). Detections are grouped by their 3D position "
+                     "and named by majority vote; targets not confirmed by 2+ photos are dropped. Code confidence: "
+                     "underwater / hazy / steeply viewed targets read at about 0.3-0.55, so keep it at 0.3 - "
+                     "false reads are removed by the 3D check.\n\nAdjusting the cameras moves them slightly: depth "
+                     "maps, point cloud, mesh and texture built before must then be rebuilt (depth maps are redone "
+                     "automatically at the next Build Depth Maps).")
             if v is None:
                 return
 
@@ -734,6 +740,10 @@ class MainWindow(QMainWindow):
                 MK.detect_markers(ch, int(v["bits"]), v["min_radius"], v["tolerance"])
                 if v["guided"]:
                     MK.refine_marker_projections(ch)
+                    MK.drop_inconsistent_auto(ch)
+                if v["adjust"] and ch.markers:
+                    from ..sfm import final_target_adjustment
+                    final_target_adjustment(ch)
             self.run("Detect markers", job)
         elif key == "optimize_gcp":
             if self._need("aligned"):

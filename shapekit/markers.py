@@ -88,7 +88,7 @@ def detect_targets_image(img, bits=12, min_radius=2.0, max_radius=60.0, toleranc
             res = _decode(gray, c, A, bits, valid, tolerance)
             if res is None:
                 continue
-            code, score, D, W = res
+            code, score, D, W, ring = res
             # subpixel centre: darkness-weighted centroid inside 1.25 r
             r = int(np.ceil(max(a, b) * 1.3)) + 1
             x0, y0 = int(cx) - r, int(cy) - r
@@ -102,14 +102,26 @@ def detect_targets_image(img, bits=12, min_radius=2.0, max_radius=60.0, toleranc
                 if wgt.sum() > 0:
                     cx, cy = (wgt * xx).sum() / wgt.sum(), (wgt * yy).sum() / wgt.sum()
             found.append(dict(code=code, number=code_to_number(code, bits), xy=(float(cx), float(cy)),
-                              radius=float(np.sqrt(a * b)), score=float(score)))
+                              radius=float(np.sqrt(a * b)), score=float(score), ring=ring, A=A.tolist()))
     # de-duplicate (two threshold passes / nested contours): keep best per location
     found.sort(key=lambda f: -f["score"])
     out = []
     for f in found:
         if all(np.hypot(f["xy"][0] - g["xy"][0], f["xy"][1] - g["xy"][1]) > 2 * f["radius"] for g in out):
             out.append(f)
-    return out
+    # a single code-ring segment of a tilted / blurred target can pass as a dot with a "code" of its own: drop
+    # detections whose centre lies on the code ring of a stronger detection (in that target's ellipse frame)
+    keep = []
+    for f in out:                                    # strongest first
+        on_ring = False
+        for g in keep:
+            d = np.linalg.norm(np.linalg.solve(np.array(g["A"]), np.subtract(f["xy"], g["xy"])))
+            if 1.3 < d < g["ring"] + 1.6:
+                on_ring = True
+                break
+        if not on_ring:
+            keep.append(f)
+    return keep
 
 
 def _decode(gray, c, A, bits, valid, tolerance):
@@ -147,7 +159,8 @@ def _decode(gray, c, A, bits, valid, tolerance):
         return None
     # the region just outside the ring must be light again (board), and just inside the ring too
     out_r = _sample_ellipse(gray, c, A, np.array([rr + 0.9, rr + 1.2]), ang)
-    in_r = _sample_ellipse(gray, c, A, np.array([max(1.4, rr - 0.9)]), ang)
+    # (checked well inside the ring: on steep, blurred views the segments' inner edges spread inwards)
+    in_r = _sample_ellipse(gray, c, A, np.array([max(1.4, rr - 1.25)]), ang)
     if (out_r < 0).any() or np.median(out_r) < thr or np.percentile(in_r, 10) < thr:
         return None
     dark = core < thr
@@ -158,7 +171,7 @@ def _decode(gray, c, A, bits, valid, tolerance):
     code = min_rotation(v, bits)
     if code not in valid:
         return None
-    return code, conf, D, W
+    return code, conf, D, W, float(rr)
 
 
 # ----------------------------------------------------------------------------- chunk-level
@@ -207,6 +220,11 @@ def detect_markers(chunk, bits=12, min_radius=2.0, tolerance=0.3, cameras=None, 
                     log("  coded targets: %d/%d photos searched" % (k + 1, len(paths)))
     else:
         dets = [_detect_job((p, bits, min_radius, tolerance)) for p in paths]
+    save_raw_detections(chunk, cams, dets, bits)
+    if tolerance > 0.45:
+        log("  note: minimum code confidence %.2f is strict - underwater / hazy / tilted targets typically read at "
+            "0.3-0.55 and are skipped. False reads are removed by the 3D check anyway, so 0.3 is recommended."
+            % tolerance)
     for k, i in enumerate(cams):
         for d in dets[k]:
             label = "target %d" % d["number"]
@@ -226,18 +244,9 @@ def detect_markers(chunk, bits=12, min_radius=2.0, tolerance=0.3, cameras=None, 
         log("Detect Markers (before alignment): %d detections -> %d candidate targets" % (n_det, len(chunk.markers)))
         chunk.add_log("Detect Markers", time.time() - t0, markers=len(chunk.markers), detections=n_det)
         return chunk.markers
-    triangulate_markers(chunk)
-    # multi-view consistency: auto-detected markers need >= min_views inlier projections and a sane error
-    kept = []
-    for m in _marker_list(chunk):
-        inl = [p for p in m["projections"].values() if not p.get("outlier")]
-        if m.get("auto") and (m.get("position") is None or len(inl) < min_views or (m.get("error_px") or 99) > 3.0):
-            continue
-        kept.append(m)
-    dropped = len(_marker_list(chunk)) - len(kept)
-    chunk.markers = kept
-    if dropped:
-        log("  rejected %d inconsistent target IDs (false detections / misreads)" % dropped)
+    # aligned: decide which detections are the same physical target from 3D geometry, name them by vote
+    regroup_auto_markers(chunk, min_views=min_views)
+    drop_inconsistent_auto(chunk, min_views=min_views)
     nm = len(_marker_list(chunk))
     chunk.add_log("Detect Markers", time.time() - t0, markers=nm, detections=n_det)
     log("Detect Markers: %d detections -> %d markers" % (n_det, nm))
@@ -249,25 +258,68 @@ def _cam_pose(chunk, i):
     return cm.rodrigues_to_R(c.rvec)[0], np.asarray(c.tvec, float), chunk.sensors[c.sensor].calib()
 
 
+def _ray_data(chunk, cams, xys):
+    """Per observation: R (n,3,3), t (n,3), normalised undistorted coords (n,2), intrinsics (n,k), centre (n,3)."""
+    R, t, xn, intr, C = [], [], [], [], []
+    for i, xy in zip(cams, xys):
+        c = chunk.cameras[i]; sen = chunk.sensors[c.sensor]
+        Ri = cm.rodrigues_to_R(np.asarray(c.rvec, float))[0]
+        R.append(Ri); t.append(np.asarray(c.tvec, float))
+        xn.append(cm.undistort_points(np.asarray(xy, float)[None], sen.calib())[0])
+        intr.append(sen.calib()); C.append(-Ri.T @ np.asarray(c.tvec, float))
+    L = max(len(v) for v in intr)
+    intr = np.array([np.concatenate([v, np.zeros(L - len(v))]) for v in intr])
+    return np.array(R), np.array(t), np.array(xn), intr, np.array(C)
+
+
+def _dlt(R, t, xn):
+    A = []
+    for Ri, ti, x in zip(R, t, xn):
+        P = np.hstack([Ri, ti[:, None]])
+        A += [x[0] * P[2] - P[0], x[1] * P[2] - P[1]]
+    X = np.linalg.svd(np.array(A))[2][-1]
+    return X[:3] / X[3] if abs(X[3]) > 1e-12 else None
+
+
+def _reproj(rv, tv, intr, xy, X):
+    p, z = cm.project(rv, tv, np.repeat(np.asarray(X, float)[None], len(rv), 0), intr)
+    return np.linalg.norm(p - xy, axis=1), z
+
+
 def triangulate_marker(chunk, m, max_err_px=4.0):
+    """3D position of a marker from its projections. Robust: the position is chosen by RANSAC over pairs of
+    projections (the hypothesis most projections agree with), so a misread or a projection on another target
+    cannot drag it away; disagreeing projections are flagged as outliers."""
     obs = [(int(k), np.array(v["xy"], float), v.get("pinned", False)) for k, v in m["projections"].items()
            if chunk.cameras[int(k)].aligned and not v.get("disabled")]
     if len(obs) < 2:
         m["position"], m["error_px"] = None, None
         return None
-    keep = list(range(len(obs)))
-    X = None
+    cams = [o[0] for o in obs]; xy = np.array([o[1] for o in obs]); pinned = np.array([o[2] for o in obs])
+    R, t, xn, intr, C = _ray_data(chunk, cams, xy)
+    rv = np.array([np.asarray(chunk.cameras[i].rvec, float) for i in cams]); tv = t
+    best, best_score = None, None
+    n = len(obs)
+    pairs = [(a, b) for a in range(n) for b in range(a + 1, n) if cams[a] != cams[b]]
+    if len(pairs) > 400:
+        pairs = [pairs[k] for k in np.random.default_rng(0).choice(len(pairs), 400, replace=False)]
+    for a, b in pairs or [(0, 1)]:
+        X0 = _dlt(R[[a, b]], t[[a, b]], xn[[a, b]])
+        if X0 is None:
+            continue
+        e, z = _reproj(rv, tv, intr, xy, X0)
+        inl = (e < max_err_px) & (z > 0)
+        sc = (int(inl.sum()) + 10 * int((inl & pinned).sum()), -float(np.minimum(e, max_err_px).sum()))
+        if best_score is None or sc > best_score:
+            best, best_score = (X0, inl), sc
+    if best is None:
+        m["position"], m["error_px"] = None, None
+        return None
+    keep = [j for j in range(n) if best[1][j] or pinned[j]]
+    if len(keep) < 2:
+        keep = list(range(n))
+    X = best[0]
     for _ in range(3):
-        A = []
-        for j in keep:
-            i, uv, _ = obs[j]
-            R, t, intr = _cam_pose(chunk, i)
-            x = cm.undistort_points(uv[None], intr)[0]
-            P = np.hstack([R, t[:, None]])
-            A += [x[0] * P[2] - P[0], x[1] * P[2] - P[1]]
-        X = np.linalg.svd(np.array(A))[2][-1]
-        X = X[:3] / X[3]
-
         def res(Xv):
             r = []
             for j in keep:
@@ -293,6 +345,205 @@ def triangulate_marker(chunk, m, max_err_px=4.0):
     m["position"] = X.tolist()
     m["error_px"] = float(np.sqrt(np.mean(np.square([errs_all[j] for j in keep]))))
     return X
+
+
+# ----------------------------------------------------------------------------- raw detections + regrouping
+RAW_FILE = "markers_raw.json"
+
+
+def _raw_path(chunk):
+    import os
+    return os.path.join(chunk.dir, RAW_FILE)
+
+
+def save_raw_detections(chunk, cams, dets, bits):
+    """Every decoded detection, per photo (also single-view ones and misreads): regrouping after alignment
+    decides which physical target each belongs to."""
+    import json, os
+    raw = load_raw_detections(chunk) or {}
+    for i, d in zip(cams, dets):
+        raw[str(i)] = [dict(xy=list(x["xy"]), number=x["number"], code=x["code"], score=x["score"],
+                            radius=x["radius"], bits=bits) for x in d]
+    p = _raw_path(chunk)
+    with open(p + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(raw, f)
+    os.replace(p + ".tmp", p)
+
+
+def load_raw_detections(chunk):
+    import json
+    try:
+        with open(_raw_path(chunk), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _px_tolerance(chunk):
+    """Marker consistency tolerance in pixels: 4 px for ~4K images, more for large sensors (27 MP: ~6 px),
+    where the camera poses themselves are only ~2 px accurate."""
+    diag = max((np.hypot(s.width, s.height) for s in chunk.sensors), default=4400)
+    return max(4.0, 0.0008 * diag)
+
+
+def regroup_auto_markers(chunk, thr_px=None, min_views=2, neighbours=25):
+    """After alignment: group ALL raw detections by 3D position (not by decoded number), then name each group
+    by a score-weighted vote of its decoded numbers. A target misread in some photos (blur, steep angle,
+    haze) keeps all its views; one ID decoded on two different physical things is split; single-view
+    misreads disappear. Manual markers and markers with reference coordinates are kept as they are."""
+    thr_px = thr_px or _px_tolerance(chunk)
+    raw = load_raw_detections(chunk)
+    if raw is None:
+        log("  coded targets: no stored detections yet - searching the aligned photos...")
+        cams = chunk.aligned_cameras()
+        from .util import fast_mode, n_workers
+        paths = [(chunk.abspath(chunk.cameras[i]), 12, 2.0, 0.3) for i in cams]
+        if fast_mode() and len(cams) > 8:
+            from concurrent.futures import ProcessPoolExecutor
+            with ProcessPoolExecutor(n_workers()) as ex:
+                dets = list(ex.map(_detect_job, paths, chunksize=4))
+        else:
+            dets = [_detect_job(a) for a in paths]
+        save_raw_detections(chunk, cams, dets, 12)
+        raw = load_raw_detections(chunk)
+    aligned = set(chunk.aligned_cameras())
+    D = [(int(k), d) for k, ds in raw.items() if int(k) in aligned for d in ds]
+    old = _marker_list(chunk)
+    fixed = [m for m in old if not m.get("auto") or m.get("reference")]
+    if len(D) < 2:
+        chunk.markers = fixed
+        return chunk.markers
+    cams = np.array([k for k, _ in D]); xy = np.array([d["xy"] for _, d in D], float)
+    score = np.array([d["score"] for _, d in D]); num = [d["number"] for _, d in D]
+    bits = D[0][1].get("bits", 12)
+    R, t, xn, intr, C = _ray_data(chunk, list(cams), xy)
+    rv = np.array([np.asarray(chunk.cameras[i].rvec, float) for i in cams])
+    # candidate pairs: detections in different, nearby photos (same physical target is seen from nearby)
+    ucams = np.unique(cams)
+    cc = {i: chunk.cameras[i].center for i in ucams}
+    near = {}
+    for i in ucams:
+        d = sorted(ucams, key=lambda j: np.linalg.norm(cc[j] - cc[i]))
+        near[i] = set(d[1:neighbours + 1])
+    hyps = []
+    n = len(D)
+    for a in range(n):
+        for b in range(a + 1, n):
+            if cams[a] == cams[b] or cams[b] not in near[cams[a]]:
+                continue
+            X = _dlt(R[[a, b]], t[[a, b]], xn[[a, b]])
+            if X is None:
+                continue
+            ra, rb = X - C[a], X - C[b]
+            ang = np.degrees(np.arccos(np.clip(ra @ rb / (np.linalg.norm(ra) * np.linalg.norm(rb) + 1e-12), -1, 1)))
+            if ang < 1.0:
+                continue
+            e, z = _reproj(rv[[a, b]], t[[a, b]], intr[[a, b]], xy[[a, b]], X)
+            if (e < thr_px).all() and (z > 0).all():
+                hyps.append(X)
+    groups = []
+    if hyps:
+        H = np.array(hyps)
+        # inlier matrix hypotheses x detections (batched projection)
+        inl = np.zeros((len(H), n), bool)
+        for h0 in range(0, len(H), max(1, 200000 // n)):
+            Hb = H[h0:h0 + max(1, 200000 // n)]
+            Xr = np.repeat(Hb, n, 0)
+            p, z = cm.project(np.tile(rv, (len(Hb), 1)), np.tile(t, (len(Hb), 1)), Xr, np.tile(intr, (len(Hb), 1)))
+            e = np.linalg.norm(p - np.tile(xy, (len(Hb), 1)), axis=1).reshape(len(Hb), n)
+            inl[h0:h0 + len(Hb)] = (e < thr_px) & (z.reshape(len(Hb), n) > 0)
+        free = np.ones(n, bool)
+        while True:
+            sup = (inl & free).sum(1)
+            h = int(np.argmax(sup + 1e-3 * ((inl & free) * score).sum(1)))
+            if sup[h] < min_views:
+                break
+            members = np.where(inl[h] & free)[0]
+            # one detection per photo: the one closest to the hypothesis
+            e, _ = _reproj(rv[members], t[members], intr[members], xy[members], H[h])
+            pick = {}
+            for j, ej in zip(members, e):
+                if cams[j] not in pick or ej < pick[cams[j]][1]:
+                    pick[cams[j]] = (j, ej)
+            sel = np.array([v[0] for v in pick.values()])
+            free[members] = False
+            if len(sel) >= min_views:
+                groups.append(sel)
+    # ---- one physical target can still form 2+ groups: in photos where its centre dot was missed, a single
+    # code segment gets detected instead - a real, fixed spot a few dot radii from the centre, so those
+    # detections agree in 3D among themselves. Merge groups closer than one target's size; keep the strongest
+    # (centre) group's detections, the others are segments (guided placement re-finds the dot in those photos).
+    n_grouped = sum(len(g) for g in groups)
+    rad_px = np.array([d.get("radius", 0.0) for _, d in D], float)
+    focal = np.array([chunk.sensors[chunk.cameras[int(i)].sensor].intr[0] for i in cams], float)
+    gX, gR = [], []
+    for g in groups:
+        Xg = _dlt(R[g], t[g], xn[g])
+        if Xg is None:
+            Xg = np.mean([_dlt(R[[a, b]], t[[a, b]], xn[[a, b]]) for a, b in zip(g[:-1], g[1:])], 0)
+        dist = np.linalg.norm(C[g] - Xg, axis=1)
+        gX.append(Xg); gR.append(float(np.median(rad_px[g] * dist / focal[g])))   # dot radius in scene units
+    order = sorted(range(len(groups)), key=lambda k: -score[groups[k]].sum())
+    merged_into, keep_g = {}, []
+    for k in order:
+        host = next((h for h in keep_g if np.linalg.norm(gX[k] - gX[h]) < 6.0 * max(gR[k], gR[h])), None)
+        if host is None:
+            keep_g.append(k)
+        else:
+            merged_into.setdefault(host, []).append(k)
+    seg_cams = {h: sorted({int(cams[j]) for k in ks for j in groups[k]}) for h, ks in merged_into.items()}
+    n_merged = sum(len(v) for v in merged_into.values())
+    groups = [groups[k] for k in keep_g]                 # keep_g is already strongest first
+    extra_cams = [seg_cams.get(k, []) for k in keep_g]
+    used, new, misread = {m["label"] for m in fixed}, [], 0
+    for gi, g in enumerate(groups):
+        votes = {}
+        for j in g:
+            if num[j] is not None:
+                votes[num[j]] = votes.get(num[j], 0.0) + score[j]
+        ranked = sorted(votes, key=lambda k: -votes[k])
+        label = next(("target %d" % k for k in ranked if "target %d" % k not in used), None)
+        if label is None:
+            k = ranked[0] if ranked else 0
+            label = next("target %d (%s)" % (k, ch_) for ch_ in "bcdefghijk" if "target %d (%s)" % (k, ch_) not in used)
+        used.add(label)
+        top = ranked[0] if ranked else None
+        misread += sum(1 for j in g if num[j] != top)
+        m = dict(label=label, code=code_table(bits)[top - 1] if top else None, bits=bits, reference=None,
+                 enabled=True, position=None, auto=True,
+                 projections={str(int(cams[j])): dict(xy=list(map(float, xy[j])), pinned=False, score=float(score[j]),
+                                                      read_as=num[j]) for j in g},
+                 votes={str(k): round(v, 3) for k, v in votes.items()})
+        prev = next((o for o in old if o["label"] == label and o.get("auto")), None)
+        if prev is not None:                      # keep user edits: enabled flag, pinned (hand-placed) projections
+            m["enabled"] = prev.get("enabled", True)
+            for k, pr in prev["projections"].items():
+                if pr.get("pinned"):
+                    m["projections"][k] = pr
+        if extra_cams[gi]:
+            m["segment_photos"] = extra_cams[gi]           # photos where only a code segment was detected
+        triangulate_marker(chunk, m, thr_px)
+        new.append(m)
+    chunk.markers = fixed + new
+    log("  coded targets regrouped by 3D position: %d detections -> %d targets (%d reads corrected by vote, "
+        "%d duplicate groups on code segments merged, %d unconfirmed detections dropped)"
+        % (n, len(new), misread, n_merged, n - n_grouped))
+    return chunk.markers
+
+
+def drop_inconsistent_auto(chunk, max_err_px=None, min_views=2):
+    max_err_px = max_err_px or 0.75 * _px_tolerance(chunk)
+    kept, dropped = [], []
+    for m in _marker_list(chunk):
+        inl = [p for p in m["projections"].values() if not p.get("outlier")]
+        bad = m.get("position") is None or len(inl) < min_views or (m.get("error_px") or 99) > max_err_px
+        if m.get("auto") and not m.get("reference") and bad:
+            dropped.append(m["label"]); continue
+        kept.append(m)
+    chunk.markers = kept
+    if dropped:
+        log("  dropped %d coded targets without a consistent 3D position: %s" % (len(dropped), ", ".join(dropped)))
+    return kept
 
 
 def triangulate_markers(chunk):
