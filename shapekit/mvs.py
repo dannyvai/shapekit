@@ -386,26 +386,38 @@ def _project_into(Xw, R, t, K):
     return uv[..., 0] / np.maximum(z, 1e-9), uv[..., 1] / np.maximum(z, 1e-9), z
 
 
-def _consistency(Di, Ki, Ri, ti, nbrs, need, rel_tol, px_tol):
-    """nbrs: list of (Dj, Kj, Rj, tj). Returns (fmask, count) exactly as the original loop."""
+STRIP_ROWS = 256        # rows per strip in the consistency check (bounds the temporary arrays per worker)
+
+
+def _consistency(Di, Ki, Ri, ti, nbrs, need, rel_tol, px_tol, strip=None):
+    """nbrs: list of (Dj, Kj, Rj, tj). Returns (fmask, count) exactly as the original whole-image loop, but
+    computed in strips of rows: on 27 MP depth maps the whole-image version needed ~4-5 GB of temporaries
+    per worker (float64 copies of every pixel per neighbour) and ran the PC out of RAM with many workers."""
     h, w = Di.shape
-    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
-    rays = np.stack([xs, ys, np.ones_like(xs)], -1) @ np.linalg.inv(Ki).T
-    Xw = (rays * Di[..., None] - ti) @ Ri
+    strip = strip or STRIP_ROWS
+    Kinv_i = np.linalg.inv(Ki)
+    Kinv_n = [np.linalg.inv(Kj) for _, Kj, _, _ in nbrs]
     cnt = np.zeros((h, w), np.uint8)
-    for Dj, Kj, Rj, tj in nbrs:
-        u, v, z = _project_into(Xw, Rj, tj, Kj)
-        ui, vi = np.round(u).astype(int), np.round(v).astype(int)
-        inb = (ui >= 0) & (ui < Dj.shape[1]) & (vi >= 0) & (vi < Dj.shape[0]) & (z > 0)
-        dj = np.zeros_like(Di)
-        dj[inb] = Dj[vi[inb], ui[inb]]
-        ok = inb & (dj > 0) & (Di > 0)
-        rays_j = np.stack([u, v, np.ones_like(u)], -1) @ np.linalg.inv(Kj).T
-        Xj = (rays_j * dj[..., None] - tj) @ Rj
-        u2, v2, z2 = _project_into(Xj, Ri, ti, Ki)
-        reproj = np.hypot(u2 - xs, v2 - ys)
-        rel = np.abs(z2 - Di) / np.maximum(Di, 1e-9)
-        cnt += (ok & (reproj < px_tol * 2) & (rel < rel_tol)).astype(np.uint8)
+    for y0 in range(0, h, strip):
+        y1 = min(h, y0 + strip)
+        ys, xs = np.mgrid[y0:y1, 0:w].astype(np.float32)
+        D = Di[y0:y1]
+        rays = np.stack([xs, ys, np.ones_like(xs)], -1) @ Kinv_i.T
+        Xw = (rays * D[..., None] - ti) @ Ri
+        c = cnt[y0:y1]
+        for (Dj, Kj, Rj, tj), Kinv_j in zip(nbrs, Kinv_n):
+            u, v, z = _project_into(Xw, Rj, tj, Kj)
+            ui, vi = np.round(u).astype(int), np.round(v).astype(int)
+            inb = (ui >= 0) & (ui < Dj.shape[1]) & (vi >= 0) & (vi < Dj.shape[0]) & (z > 0)
+            dj = np.zeros_like(D)
+            dj[inb] = Dj[vi[inb], ui[inb]]
+            ok = inb & (dj > 0) & (D > 0)
+            rays_j = np.stack([u, v, np.ones_like(u)], -1) @ Kinv_j.T
+            Xj = (rays_j * dj[..., None] - tj) @ Rj
+            u2, v2, z2 = _project_into(Xj, Ri, ti, Ki)
+            reproj = np.hypot(u2 - xs, v2 - ys)
+            rel = np.abs(z2 - D) / np.maximum(D, 1e-9)
+            c += (ok & (reproj < px_tol * 2) & (rel < rel_tol)).astype(np.uint8)
     return (cnt >= need) & (Di > 0), cnt
 
 
@@ -439,8 +451,20 @@ def filter_depth_maps(chunk, mode="moderate", nbmap=None, views=None, rel_tol=0.
                  {k: poses[k] for k in [i] + [j for j in nbmap.get(i, []) if j in poses]}, need, rel_tol, px_tol)
                 for i in aligned]
         from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(n_workers()) as ex:
-            for k, _ in enumerate(ex.map(_filter_job, jobs, chunksize=2)):
+        from .util import available_memory
+        # each worker holds its depth map + its neighbours' (float32) + strip temporaries: limit the workers
+        # to what fits in ~60 % of the free RAM (27 MP maps: ~0.8 GB per worker instead of ~5 GB before)
+        px = max((np.load(os.path.join(ddir, "%05d.npz" % i))["depth"].size for i in aligned[:3]), default=1)
+        nn = max((len(j[2]) for j in jobs), default=1)
+        per_worker = px * 4 * (nn + 1) + STRIP_ROWS * (px ** 0.5) * 8 * 40 * 2 + 200e6
+        avail = available_memory()
+        nw = n_workers()
+        if avail:
+            nw = max(1, min(nw, int(0.6 * avail // per_worker)))
+        log("  filtering on %d workers (%.1f GB each, %s GB free)" % (nw, per_worker / 1e9,
+                                                                    "%.0f" % (avail / 1e9) if avail else "?"))
+        with ProcessPoolExecutor(nw) as ex:
+            for k, _ in enumerate(ex.map(_filter_job, jobs, chunksize=1)):
                 if (k + 1) % max(1, len(jobs) // 10) == 0:
                     log("  filtered %d/%d depth maps" % (k + 1, len(jobs)))
         log("  depth filtering (%s) done" % mode)

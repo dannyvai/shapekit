@@ -45,6 +45,10 @@ class ModelView(QWidget):
         self._lasso_actor = None
         self._box = None
         self.measure_pts = []
+        from .view_cube import ViewCube
+        self.view_cube = ViewCube(self.plotter, self._model_frame)   # orientation cube, top-right corner
+        self._cube_press = None
+        self.iw.setMouseTracking(True)
         self.iw.installEventFilter(self)
 
     # ------------------------------------------------------------------ data
@@ -218,6 +222,53 @@ class ModelView(QWidget):
         self.plotter.reset_camera_clipping_range()
         self.plotter.render()
 
+    def _model_frame(self):
+        """Model axes (rows X, Y, Z-up) in world coordinates: the region's frame, as Front/Top/Side use."""
+        ch = self.chunk
+        if ch is not None and ch.region and ch.region.get("R") is not None:
+            return np.array(ch.region["R"], float)
+        return None
+
+    def _display_xy(self, pos):
+        """Qt widget position -> VTK display pixels (origin bottom-left, physical pixels on HiDPI screens)."""
+        r = self.iw.devicePixelRatioF()
+        return pos.x() * r, (self.iw.height() - pos.y()) * r - 1
+
+    def _cube_event(self, ev, t):
+        """Clicks on the view cube, in any mode. True = handled (the trackball never sees them)."""
+        vc = getattr(self, "view_cube", None)
+        if vc is None:
+            return False
+        if t == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
+            p = ev.position().toPoint()
+            if vc.contains(*self._display_xy(p)):
+                self._cube_press = p
+                return True
+            return False
+        if t == QEvent.MouseMove:
+            if self._cube_press is not None:
+                return True
+            if not ev.buttons():                       # hover: hand over the cube
+                over = vc.hit(*self._display_xy(ev.position().toPoint())) is not None
+                if over != getattr(self, "_cube_hover", False):
+                    self._cube_hover = over
+                    if over:
+                        self.iw.setCursor(Qt.PointingHandCursor)
+                    else:
+                        self.iw.unsetCursor()
+            return False
+        if t == QEvent.MouseButtonRelease and ev.button() == Qt.LeftButton and self._cube_press is not None:
+            p = ev.position().toPoint()
+            moved = (p - self._cube_press).manhattanLength()
+            self._cube_press = None
+            if moved <= 6:
+                vc.click(*self._display_xy(p))
+            return True
+        return False
+
+    def set_view_cube(self, on):
+        self.view_cube.set_visible(on)
+
     def view_from(self, axis):
         ch = self.chunk
         if ch is None or not ch.region:
@@ -363,9 +414,13 @@ class ModelView(QWidget):
         self.plotter.render()
 
     def eventFilter(self, obj, ev):
-        if obj is not getattr(self, "iw", None) or getattr(self, "mode", "navigate") == "navigate":
+        if obj is not getattr(self, "iw", None):
             return False
         t = ev.type()
+        if t in (QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.MouseButtonRelease) and self._cube_event(ev, t):
+            return True
+        if getattr(self, "mode", "navigate") == "navigate":
+            return False
         if t == QEvent.MouseButtonPress and ev.button() == Qt.LeftButton:
             p = ev.position().toPoint()
             mods = ev.modifiers()

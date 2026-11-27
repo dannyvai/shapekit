@@ -40,6 +40,7 @@ class ParamDialog(QDialog):
             lay.addWidget(lb)
         form = QFormLayout()
         lay.addLayout(form)
+        self.defaults = {f[0]: f[3] for f in fields}
         for key, label, kind, default, opts in fields:
             if kind == "choice":
                 w = QComboBox(); w.addItems([str(o) for o in opts]); w.setCurrentText(str(default))
@@ -55,6 +56,9 @@ class ParamDialog(QDialog):
             self.widgets[key] = (kind, w)
             form.addRow(label, w)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        b_def = bb.addButton("Defaults", QDialogButtonBox.ResetRole)
+        b_def.setToolTip("Put back the original values")
+        b_def.clicked.connect(lambda: self.set_values(self.defaults))
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
@@ -92,6 +96,36 @@ class ParamDialog(QDialog):
 
     last = None           # (title, values) of the most recently accepted dialog -> crash-recovery record
     prefill = None        # {title: values}: open these dialogs with these values (resuming a crashed task)
+    memory_path = None    # <project>/dialog_settings.json: last values per dialog, per project (set by the app)
+    # options that throw work away are never remembered: they always open at their (safe) default
+    NEVER_REMEMBER = {"reset", "reset_features", "force", "adjust"}
+
+    @classmethod
+    def _memory(cls):
+        import json
+        if not cls.memory_path:
+            return {}
+        try:
+            with open(cls.memory_path, encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    @classmethod
+    def _remember(cls, title, values):
+        import json, os
+        if not cls.memory_path:
+            return
+        d = cls._memory()
+        d[title] = {k: v for k, v in values.items() if k not in cls.NEVER_REMEMBER}
+        try:
+            tmp = cls.memory_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=1)
+            os.replace(tmp, cls.memory_path)
+        except OSError:
+            pass
 
     @staticmethod
     def ask(title, fields, parent=None, note=None):
@@ -99,7 +133,13 @@ class ParamDialog(QDialog):
         if ParamDialog.prefill and title in ParamDialog.prefill:
             d.set_values(ParamDialog.prefill[title])
             d.setWindowTitle(title + " — continue after crash")
+        else:
+            saved = ParamDialog._memory().get(title)
+            if saved:                                   # the values last used for this dialog in this project
+                d.set_values({k: v for k, v in saved.items() if k not in ParamDialog.NEVER_REMEMBER})
+                d.setWindowTitle(title + " — last used settings")
         if d.exec() != QDialog.Accepted:
             return None
         ParamDialog.last = (title, d.values())
+        ParamDialog._remember(title, ParamDialog.last[1])
         return ParamDialog.last[1]

@@ -191,6 +191,10 @@ class MainWindow(QMainWindow):
         self._act(v, "Top", lambda: self.model.view_from("top"), "7")
         self._act(v, "Front", lambda: self.model.view_from("front"), "8")
         self._act(v, "Side", lambda: self.model.view_from("side"), "9")
+        self.a_cube = self._act(v, "View Cube", self._toggle_view_cube, checkable=True,
+                                tip="Orientation cube in the corner: click a face, edge or corner to look from there")
+        self.a_cube.setChecked(self.settings.value("view_cube", "true") in (True, "true", "1"))
+        self.model.set_view_cube(self.a_cube.isChecked())
 
         tb = QToolBar("Tools"); tb.setObjectName("tools"); self.addToolBar(tb)
         self.mode_group = QActionGroup(self)
@@ -241,6 +245,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("last_project", self.project.dir)
         crashed = projlog.crashed_task(self.project.dir)
         projlog.open_log(self.project.dir, "gui")
+        ParamDialog.memory_path = os.path.join(self.project.dir, "dialog_settings.json")
         if crashed:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(400, lambda: self._offer_resume(crashed))
@@ -248,6 +253,11 @@ class MainWindow(QMainWindow):
         for k in range(self.tabs.count() - 1, 0, -1):
             self.tabs.removeTab(k)
         self.refresh_all(reset_camera=True)
+
+    def _toggle_view_cube(self, on=None):
+        on = self.a_cube.isChecked()
+        self.settings.setValue("view_cube", "true" if on else "false")
+        self.model.set_view_cube(on)
 
     def underwater_colour(self):
         if not self._need("aligned"):
