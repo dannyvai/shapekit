@@ -15,6 +15,11 @@ echo [3/5] adding models, ffmpeg, readme ...
 uv run python -u packaging\finish_build.py || exit /b 3
 echo [4/5] smoke test of the frozen app ...
 set TORCH_HOME=
-dist\ShapeKit\shapekit-cli.exe doctor projects\gpu_test || exit /b 4
+rem the GUI check also opens a test project when this PC has one (projects\gpu_test)
+if exist projects\gpu_test\project.json (
+    dist\ShapeKit\shapekit-cli.exe doctor projects\gpu_test || exit /b 4
+) else (
+    dist\ShapeKit\shapekit-cli.exe doctor || exit /b 4
+)
 echo [5/5] BUILD OK: dist\ShapeKit
 exit /b 0

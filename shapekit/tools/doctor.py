@@ -6,6 +6,10 @@ import traceback
 
 
 def main(project=None):
+    import os
+    if project and not os.path.exists(os.path.join(project, "project.json")):
+        print("note: test project %s not found on this PC - checking the GUI without a project" % project, flush=True)
+        project = None
     ok = True
 
     def item(name, fn):
