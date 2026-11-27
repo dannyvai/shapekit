@@ -21,7 +21,7 @@ FEATURES = ["auto", "aliked", "superpoint", "disk", "sift"]
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, project_dir=None):
+    def __init__(self, project_dir=None, open_last=True):
         super().__init__()
         self.setWindowTitle("shapekit")
         self.resize(1600, 980)
@@ -77,7 +77,7 @@ class MainWindow(QMainWindow):
 
         if project_dir:
             self.open_project(project_dir)
-        else:
+        elif open_last:
             last = self.settings.value("last_project")
             if last and os.path.exists(os.path.join(last, Project.FILE)):
                 self.open_project(last)
@@ -167,6 +167,8 @@ class MainWindow(QMainWindow):
         self._act(t, "Filter Point Cloud by Confidence…", self.filter_confidence)
         self._act(t, "Select Small Mesh Components…", self.select_components)
         t.addSeparator()
+        self._act(t, "Benchmark Feature Methods…", self.bench_features,
+                  tip="Compare SIFT / SuperPoint / ALIKED / DISK on a few photo pairs of this project (HTML report)")
         self._act(t, "Underwater Colour…", self.underwater_colour,
                   tip="White balance from a reference patch, or remove the water's colour cast per pixel (for the texture)")
         t.addSeparator()
@@ -258,6 +260,32 @@ class MainWindow(QMainWindow):
         on = self.a_cube.isChecked()
         self.settings.setValue("view_cube", "true" if on else "false")
         self.model.set_view_cube(on)
+
+    def bench_features(self):
+        if not self._need(None):
+            return
+        v = ParamDialog.ask("Benchmark Feature Methods", [
+            ("pairs", "Photo pairs", "int", 5, (2, 20)),
+            ("accuracy", "Accuracy (as in Align Photos)", "choice", "high", ["highest", "high", "medium", "low", "lowest"]),
+            ("max_features", "Max features per photo", "int", 4096, (500, 40000)),
+            ("sift", "RootSIFT + FLANN (CPU)", "bool", True, None),
+            ("superpoint", "SuperPoint + LightGlue", "bool", True, None),
+            ("aliked", "ALIKED + LightGlue", "bool", True, None),
+            ("disk", "DISK + LightGlue", "bool", True, None)], self,
+            note="Runs each detector + matcher on a few photo pairs spread over the project (near and wider baselines) "
+                 "and opens a report with the matches drawn, a comparison table and a recommendation. If the project "
+                 "is aligned, matches are also checked against the camera poses.")
+        if v is None:
+            return
+        methods = [m for m in ("sift", "superpoint", "aliked", "disk") if v[m]]
+        from ..tools.feature_bench import run as bench
+        self.project.save()
+        d = self.project.dir
+
+        def done(res):
+            if res:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(res[0]))
+        self.run("Benchmark feature methods", bench, d, v["pairs"], methods, v["accuracy"], v["max_features"], done=done)
 
     def underwater_colour(self):
         if not self._need("aligned"):
